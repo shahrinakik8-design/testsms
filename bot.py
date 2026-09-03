@@ -5,7 +5,7 @@ Zebra SMS Telegram Bot — bottom keyboard UI + admin service/country manager.
 Setup:
     pip install -r requirements.txt
     export TELEGRAM_BOT_TOKEN="8821322242:AAFiDVoQewpGhHAR40mGXkOLd1ksjVdua9E"
-    export ADMIN_IDS="1586853120"   # your numeric Telegram user id(s)
+    export ADMIN_IDS="1586853120,22222222"   # your numeric Telegram user id(s)
     python3 bot.py
 
 Find your Telegram user id via @userinfobot.
