@@ -1,158 +1,205 @@
 #!/usr/bin/env python3
 """
-Zebra SMS API Bot
-Wraps the three endpoints (getnum, getupdate, liveaccess) into a simple
-interactive CLI: browse which ranges are delivering, grab a number, and
-auto-poll for the incoming code.
+Zebra SMS Telegram Bot (multi-user)
+Wraps the getnum / getupdate / liveaccess endpoints as Telegram commands.
+Each /getnum wait runs as its own background asyncio task, so many users
+can use the bot at the same time without blocking each other.
 
-Usage:
-    python3 zebra_bot.py                 # interactive menu
-    python3 zebra_bot.py ranges [sender]  # list live ranges
-    python3 zebra_bot.py get <range>      # allocate a number + wait for code
+Setup:
+    pip install -r requirements.txt
+    export TELEGRAM_BOT_TOKEN="123456:ABC-your-bot-father-token"
+    python3 telegram_bot.py
+
+Commands:
+    /ranges [sender]   - show which ranges are delivering right now
+    /getnum <range>    - allocate a number from that range and wait for its code
+    /codes             - show your last received codes
+    /cancel            - stop waiting for your current number's code
 """
 
-import sys
+import os
 import time
-import json
+import asyncio
 import requests
+from telegram import Update
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
 BASE_URL = "https://zebrasms.com/api/v1"
-API_KEY = "6U3G3DDZ6GB"   # move to an env var if you reuse this script elsewhere
+API_KEY = "6U3G3DDZ6GB"   # from the Zebra SMS dashboard
+BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 
 HEADERS = {
     "MAuth": API_KEY,
     "Content-Type": "application/json",
 }
 
+# chat_id -> asyncio.Task currently waiting for that chat's code
+ACTIVE_TASKS = {}
 
-def _call(method, path, **kwargs):
+
+def _call_sync(method, path, **kwargs):
+    """Blocking HTTP call — always run this through asyncio.to_thread."""
     url = f"{BASE_URL}{path}"
-    try:
-        resp = requests.request(method, url, headers=HEADERS, timeout=15, **kwargs)
-        data = resp.json()
-    except requests.RequestException as e:
-        print(f"[network error] {e}")
-        return None
-    except json.JSONDecodeError:
-        print(f"[bad response] {resp.text[:200]}")
-        return None
-
+    resp = requests.request(method, url, headers=HEADERS, timeout=15, **kwargs)
+    data = resp.json()
     meta = data.get("meta", {})
     if meta.get("code") != 0:
-        print(f"[api error {meta.get('code')}] {meta.get('error')}")
-        return None
+        raise RuntimeError(meta.get("error") or f"API error {meta.get('code')}")
     return data.get("data")
 
 
-def live_ranges(sender=None):
+async def api_call(method, path, **kwargs):
+    """Non-blocking wrapper so one user's request never stalls the bot's event loop."""
+    return await asyncio.to_thread(_call_sync, method, path, **kwargs)
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Zebra SMS bot.\n\n"
+        "/ranges [sender] - which ranges are delivering\n"
+        "/getnum <range>  - allocate a number and wait for its code\n"
+        "/codes           - last received codes\n"
+        "/cancel          - stop waiting for your current code"
+    )
+
+
+async def ranges(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    sender = context.args[0] if context.args else None
     params = {"sender": sender} if sender else {}
-    data = _call("GET", "/publicapi/liveaccess", params=params)
-    if not data:
-        return []
+    try:
+        data = await api_call("GET", "/publicapi/liveaccess", params=params)
+    except RuntimeError as e:
+        await update.message.reply_text(f"Error: {e}")
+        return
+
     rows = data.get("rows", [])
-    print(f"\n{data.get('count', 0)} sender(s) delivering right now:\n")
-    for row in rows:
-        print(f"  {row['sender']:<15} -> {', '.join(row['ranges'])}")
-    print()
-    return rows
+    if not rows:
+        await update.message.reply_text("No matching senders right now.")
+        return
+
+    lines = [f"*{r['sender']}* -> {', '.join(r['ranges'])}" for r in rows]
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
-def get_number(rng):
-    data = _call("POST", "/publicapi/getnum", json={"range": rng})
-    if not data or not data.get("rows"):
-        return None
-    row = data["rows"][0]
-    print(f"\nAllocated: {row['number']}  ({row['country']} / {row['operator']})")
-    print(f"Expires:   {time.strftime('%H:%M:%S', time.localtime(row['expires_ms'] / 1000))}\n")
-    return row
+async def codes(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        data = await api_call("GET", "/publicapi/getupdate")
+    except RuntimeError as e:
+        await update.message.reply_text(f"Error: {e}")
+        return
+
+    rows = data.get("rows", [])
+    if not rows:
+        await update.message.reply_text("No codes received yet.")
+        return
+
+    lines = [f"{r['number']} ({r['sender']}): {r['message']}" for r in rows[:15]]
+    await update.message.reply_text("\n".join(lines))
 
 
-def get_updates():
-    data = _call("GET", "/publicapi/getupdate")
-    if not data:
-        return []
-    return data.get("rows", [])
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    task = ACTIVE_TASKS.get(chat_id)
+    if task and not task.done():
+        task.cancel()
+        await update.message.reply_text("Stopped waiting.")
+    else:
+        await update.message.reply_text("Nothing in progress.")
 
 
-def wait_for_code(number, expires_ms, poll_interval=3):
-    """Poll getupdate until a message for `number` shows up or it expires."""
-    print(f"Waiting for a code on {number} (Ctrl+C to stop)...")
-    seen = set()
-    # Prime `seen` so we don't report codes that arrived before we started.
-    for row in get_updates():
-        seen.add((row["number"], row["message"], row["at_ms"]))
+async def _wait_for_code(chat_id, number, expires_ms, context: ContextTypes.DEFAULT_TYPE):
+    """Runs as its own background task per chat — doesn't block other users."""
+    try:
+        seen_data = await api_call("GET", "/publicapi/getupdate")
+        seen = {(r["number"], r["message"], r["at_ms"]) for r in seen_data.get("rows", [])}
+    except RuntimeError:
+        seen = set()
 
     try:
         while True:
-            now_ms = int(time.time() * 1000)
-            if now_ms > expires_ms:
-                print("Number expired with no code received.")
-                return None
+            if int(time.time() * 1000) > expires_ms:
+                await context.bot.send_message(chat_id, f"{number} expired with no code received.")
+                return
 
-            for row in get_updates():
-                key = (row["number"], row["message"], row["at_ms"])
-                if row["number"] == number and key not in seen:
-                    seen.add(key)
-                    print(f"\nCode received from {row['sender']}: {row['message']}\n")
-                    return row
+            try:
+                data = await api_call("GET", "/publicapi/getupdate")
+            except RuntimeError as e:
+                await context.bot.send_message(chat_id, f"Error polling for code: {e}")
+                return
 
-            time.sleep(poll_interval)
-    except KeyboardInterrupt:
-        print("\nStopped waiting.")
-        return None
+            for r in data.get("rows", []):
+                key = (r["number"], r["message"], r["at_ms"])
+                if r["number"] == number and key not in seen:
+                    await context.bot.send_message(
+                        chat_id,
+                        f"Code from {r['sender']} on {number}:\n{r['message']}",
+                    )
+                    return
 
-
-def allocate_and_wait(rng):
-    row = get_number(rng)
-    if not row:
+            await asyncio.sleep(3)
+    except asyncio.CancelledError:
+        # /cancel was called — exit quietly.
         return
-    wait_for_code(row["number"], row["expires_ms"])
+    finally:
+        ACTIVE_TASKS.pop(chat_id, None)
 
 
-def recent_codes():
-    rows = get_updates()
-    if not rows:
-        print("No codes yet.")
+async def getnum(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+
+    if not context.args:
+        await update.message.reply_text("Usage: /getnum 22501XXX")
         return
-    print(f"\nLast {len(rows)} code(s):\n")
-    for r in rows:
-        print(f"  {r['number']:<18} {r['sender']:<10} {r['message']}")
-    print()
+    rng = context.args[0]
+
+    existing = ACTIVE_TASKS.get(chat_id)
+    if existing and not existing.done():
+        await update.message.reply_text("Already waiting on a number — use /cancel first.")
+        return
+
+    try:
+        data = await api_call("POST", "/publicapi/getnum", json={"range": rng})
+    except RuntimeError as e:
+        await update.message.reply_text(f"Error: {e}")
+        return
+
+    if not data or not data.get("rows"):
+        await update.message.reply_text("No number returned for that range.")
+        return
+
+    row = data["rows"][0]
+    number = row["number"]
+    expires_ms = row["expires_ms"]
+    expires_str = time.strftime("%H:%M:%S", time.localtime(expires_ms / 1000))
+
+    await update.message.reply_text(
+        f"Allocated: {number}\n"
+        f"{row['country']} / {row['operator']}\n"
+        f"Expires at {expires_str}\n\n"
+        f"Waiting for the code... (/cancel to stop)"
+    )
+
+    task = asyncio.create_task(_wait_for_code(chat_id, number, expires_ms, context))
+    ACTIVE_TASKS[chat_id] = task
 
 
-def menu():
-    while True:
-        print("=" * 40)
-        print("Zebra SMS Bot")
-        print("=" * 40)
-        print("1) Show live ranges (which senders are delivering)")
-        print("2) Allocate a number and wait for its code")
-        print("3) Show last 50 received codes")
-        print("4) Quit")
-        choice = input("> ").strip()
+def main():
+    if not BOT_TOKEN:
+        raise SystemExit(
+            "Set TELEGRAM_BOT_TOKEN first, e.g.\n"
+            "  export TELEGRAM_BOT_TOKEN='123456:ABC-your-token'"
+        )
 
-        if choice == "1":
-            sender = input("Filter by sender (blank for all): ").strip() or None
-            live_ranges(sender)
-        elif choice == "2":
-            rng = input("Range to allocate from (e.g. 22501XXX): ").strip()
-            if rng:
-                allocate_and_wait(rng)
-        elif choice == "3":
-            recent_codes()
-        elif choice == "4":
-            break
-        else:
-            print("Not a valid option.\n")
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("ranges", ranges))
+    app.add_handler(CommandHandler("getnum", getnum))
+    app.add_handler(CommandHandler("codes", codes))
+    app.add_handler(CommandHandler("cancel", cancel))
+
+    print("Bot running...")
+    app.run_polling()
 
 
 if __name__ == "__main__":
-    args = sys.argv[1:]
-    if not args:
-        menu()
-    elif args[0] == "ranges":
-        live_ranges(args[1] if len(args) > 1 else None)
-    elif args[0] == "get" and len(args) > 1:
-        allocate_and_wait(args[1])
-    else:
-        print(__doc__)
+    main()
