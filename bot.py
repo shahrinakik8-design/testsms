@@ -4,7 +4,7 @@ Zebra SMS Telegram Bot — bottom keyboard UI + admin service/country manager.
 
 Setup:
     pip install -r requirements.txt
-    export TELEGRAM_BOT_TOKEN="123456:ABC-your-bot-father-token"
+    export TELEGRAM_BOT_TOKEN="8821322242:AAFiDVoQewpGhHAR40mGXkOLd1ksjVdua9E"
     export ADMIN_IDS="1586853120"   # your numeric Telegram user id(s)
     python3 bot.py
 
@@ -44,7 +44,8 @@ ADMIN_IDS = {int(x) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.str
 
 HEADERS = {"MAuth": API_KEY, "Content-Type": "application/json"}
 
-SERVICES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "services.json")
+DATA_DIR = os.environ.get("DATA_DIR", os.path.dirname(os.path.abspath(__file__)))
+SERVICES_FILE = os.path.join(DATA_DIR, "services.json")
 
 ACTIVE_TASKS = {}          # chat_id -> asyncio.Task waiting for a code
 KNOWN_USERS = set()        # chat_ids that have started the bot (in-memory only)
