@@ -1,4 +1,1 @@
-python-telegram-bot>=20.0
-requests
-aiohttp
-py_liveaccess
+requests>=2.31.0
