@@ -478,13 +478,19 @@ async def show_admin_sender_list(query, service):
         await query.edit_message_text(f"⚠️ Error: {e}", reply_markup=services_menu_kb())
         return
     rows = data.get("rows", [])
+    manual_btn = [InlineKeyboardButton("✍️ Enter Range Manually", callback_data=f"adm:acrmanual:{service}")]
     if not rows:
-        await query.edit_message_text("No senders delivering right now.", reply_markup=services_menu_kb())
+        buttons = [manual_btn, [InlineKeyboardButton("⬅️ Back", callback_data="adm:services")]]
+        await query.edit_message_text(
+            "No senders delivering right now, but you can still add a range you already know:",
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
         return
     buttons = [
         [InlineKeyboardButton(f"{r['sender']} ({len(r['ranges'])})", callback_data=f"adm:acrsender:{service}:{r['sender']}")]
         for r in rows[:30]
     ]
+    buttons.append(manual_btn)
     buttons.append([InlineKeyboardButton("⬅️ Back", callback_data="adm:services")])
     await query.edit_message_text(
         f"📡 Pick a sender for *{service}*:", parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup(buttons)
@@ -518,10 +524,183 @@ def services_menu_kb():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("➕ Add Service", callback_data="adm:svc_add")],
         [InlineKeyboardButton("🌍 Add Country to Service", callback_data="adm:svc_addcountry")],
+        [InlineKeyboardButton("🔄 Auto-Sync From Live Console", callback_data="adm:svc_autosync")],
+        [InlineKeyboardButton("⏱ Auto-Sync Settings", callback_data="adm:autosync_settings")],
         [InlineKeyboardButton("📋 List Services", callback_data="adm:svc_list")],
         [InlineKeyboardButton("🗑 Remove Service", callback_data="adm:svc_remove")],
         [InlineKeyboardButton("⬅️ Back", callback_data="adm:home")],
     ])
+
+
+def sync_service_with_live_rows(service, rows):
+    """Core sync logic shared by the manual 'Auto-Sync' button and the
+    background job: merge every distinct range from `rows` (as returned by
+    /publicapi/liveaccess) into `services[service]`, auto-guessing the
+    country from the range prefix. Existing ranges are left untouched;
+    name clashes get a numeric suffix. Returns a stats dict and the list
+    of (country, range) pairs that were newly added."""
+    if service not in services:
+        return None, []
+
+    bucket = services[service]
+    added, skipped_existing, unknown = 0, 0, 0
+    newly_added = []
+
+    all_ranges = []
+    seen_ranges = set()
+    for r in rows:
+        for rng in r.get("ranges", []):
+            if rng not in seen_ranges:
+                seen_ranges.add(rng)
+                all_ranges.append(rng)
+
+    for rng in all_ranges:
+        if rng in bucket.values():
+            skipped_existing += 1
+            continue
+
+        country = guess_country_from_range(rng)
+        if not country:
+            unknown += 1
+            country = rng  # fall back to using the range itself as the label
+
+        base_country, n = country, 2
+        while country in bucket and bucket[country] != rng:
+            country = f"{base_country} ({n})"
+            n += 1
+
+        bucket[country] = rng
+        added += 1
+        newly_added.append((country, rng))
+
+    stats = {
+        "added": added,
+        "skipped_existing": skipped_existing,
+        "unknown": unknown,
+        "total_seen": len(all_ranges),
+    }
+    return stats, newly_added
+
+
+async def auto_sync_service(query, service):
+    """Manual (button-triggered) sync for a single service. Fetches live
+    ranges then delegates the merge to sync_service_with_live_rows."""
+    if service not in services:
+        await query.edit_message_text("That service no longer exists.", reply_markup=services_menu_kb())
+        return
+
+    await query.edit_message_text(f"🔄 Syncing live ranges into *{service}*...", parse_mode=ParseMode.MARKDOWN)
+
+    try:
+        data = await api_call("GET", "/publicapi/liveaccess")
+    except Exception as e:
+        await query.edit_message_text(f"⚠️ Error: {e}", reply_markup=services_menu_kb())
+        return
+
+    rows = data.get("rows", [])
+    stats, _ = sync_service_with_live_rows(service, rows)
+    save_services()
+
+    text = (
+        f"✅ *Auto-sync complete for {service}*\n\n"
+        f"➕ Added: {stats['added']}\n"
+        f"⏭ Already present: {stats['skipped_existing']}\n"
+        f"❓ Unknown country (labeled by range): {stats['unknown']}\n\n"
+        f"Total live ranges seen: {stats['total_seen']}"
+    )
+    await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=services_menu_kb())
+
+
+# ── Periodic background sync (every AUTOSYNC_INTERVAL_SECONDS) ─────────
+
+AUTOSYNC_INTERVAL_SECONDS = int(os.environ.get("AUTOSYNC_INTERVAL_SECONDS", "300"))  # 5 min default
+AUTOSYNC_ENABLED = os.environ.get("AUTOSYNC_ENABLED", "1") not in ("0", "false", "False")
+
+
+async def run_periodic_sync(context: ContextTypes.DEFAULT_TYPE):
+    """JobQueue callback: syncs every configured service against the live
+    console. Runs quietly — only pings admins when something actually
+    changed, so it never spams them every 5 minutes for nothing."""
+    if not services:
+        return
+
+    try:
+        data = await api_call("GET", "/publicapi/liveaccess")
+    except Exception as e:
+        logger.warning("Periodic sync: failed to fetch live ranges: %s", e)
+        return
+
+    rows = data.get("rows", [])
+    report_lines = []
+    total_added = 0
+
+    for service in list(services.keys()):
+        stats, newly_added = sync_service_with_live_rows(service, rows)
+        if stats and stats["added"] > 0:
+            total_added += stats["added"]
+            preview = ", ".join(f"{c} ({r})" for c, r in newly_added[:8])
+            if len(newly_added) > 8:
+                preview += f", +{len(newly_added) - 8} more"
+            report_lines.append(f"*{service}*: +{stats['added']} → {preview}")
+
+    if total_added == 0:
+        return  # nothing new — stay silent
+
+    save_services()
+
+    text = (
+        f"🔄 *Auto-sync* found {total_added} new range(s):\n\n" + "\n".join(report_lines)
+    )
+    for admin_id in ADMIN_IDS:
+        try:
+            await context.bot.send_message(admin_id, text, parse_mode=ParseMode.MARKDOWN)
+        except Exception as e:
+            logger.warning("Could not notify admin %s: %s", admin_id, e)
+
+
+AUTOSYNC_JOB_NAME = "periodic_range_sync"
+
+
+def schedule_autosync_job(job_queue):
+    """(Re)schedule the periodic sync job. Safe to call multiple times —
+    removes any existing job with the same name first."""
+    for job in job_queue.get_jobs_by_name(AUTOSYNC_JOB_NAME):
+        job.schedule_removal()
+    if AUTOSYNC_ENABLED:
+        job_queue.run_repeating(
+            run_periodic_sync,
+            interval=AUTOSYNC_INTERVAL_SECONDS,
+            first=AUTOSYNC_INTERVAL_SECONDS,
+            name=AUTOSYNC_JOB_NAME,
+        )
+
+
+async def toggle_autosync(query, context: ContextTypes.DEFAULT_TYPE):
+    global AUTOSYNC_ENABLED
+    AUTOSYNC_ENABLED = not AUTOSYNC_ENABLED
+    schedule_autosync_job(context.job_queue)
+    await show_autosync_settings(query)
+
+
+async def show_autosync_settings(query):
+    status = "🟢 ON" if AUTOSYNC_ENABLED else "🔴 OFF"
+    text = (
+        f"⏱ *Background Auto-Sync*\n\n"
+        f"Status: {status}\n"
+        f"Interval: every {AUTOSYNC_INTERVAL_SECONDS // 60} min\n\n"
+        f"When on, the bot checks the live console every "
+        f"{AUTOSYNC_INTERVAL_SECONDS // 60} minutes and merges any new "
+        f"range into every configured service automatically. Admins get a "
+        f"message only when something new is actually found."
+    )
+    buttons = [
+        [InlineKeyboardButton(
+            "🔴 Turn Off" if AUTOSYNC_ENABLED else "🟢 Turn On",
+            callback_data="adm:autosync_toggle",
+        )],
+        [InlineKeyboardButton("⬅️ Back", callback_data="adm:services")],
+    ]
+    await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup(buttons))
 
 
 async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -579,6 +758,29 @@ async def admin_callback_router(update: Update, context: ContextTypes.DEFAULT_TY
         buttons.append([InlineKeyboardButton("⬅️ Back", callback_data="adm:services")])
         await query.edit_message_text("Pick the service to add a country to:", reply_markup=InlineKeyboardMarkup(buttons))
 
+    elif data == "adm:svc_autosync":
+        if not services:
+            await query.edit_message_text("No services yet — add one first.", reply_markup=services_menu_kb())
+            return
+        buttons = [[InlineKeyboardButton(name, callback_data=f"adm:autosync:{name}")] for name in services.keys()]
+        buttons.append([InlineKeyboardButton("⬅️ Back", callback_data="adm:services")])
+        await query.edit_message_text(
+            "🔄 Pick which service to sync ALL live ranges into:\n"
+            "_(every currently live sender's ranges will be pulled in, with country auto-guessed)_",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+
+    elif data.startswith("adm:autosync:"):
+        service = data.split(":", 2)[2]
+        await auto_sync_service(query, service)
+
+    elif data == "adm:autosync_settings":
+        await show_autosync_settings(query)
+
+    elif data == "adm:autosync_toggle":
+        await toggle_autosync(query, context)
+
     elif data.startswith("adm:svcpick:"):
         service = data.split(":", 2)[2]
         await show_admin_sender_list(query, service)
@@ -586,6 +788,14 @@ async def admin_callback_router(update: Update, context: ContextTypes.DEFAULT_TY
     elif data.startswith("adm:acrsender:"):
         _, _, service, sender = data.split(":", 3)
         await show_admin_ranges_for_sender(query, service, sender)
+
+    elif data.startswith("adm:acrmanual:"):
+        service = data.split(":", 2)[2]
+        ADMIN_STATE[chat_id] = ("add_country_manual", service)
+        await query.edit_message_text(
+            f"✍️ Send the country and range for *{service}* like this:\n`Ivory Coast 22501XXX`\n\nSend /cancel to abort.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
 
     elif data.startswith("adm:acrrange:"):
         _, _, service, rng = data.split(":", 3)
@@ -665,6 +875,23 @@ async def admin_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
             save_services()
             await update.message.reply_text(f"✅ Service '{text}' added. Now add countries to it from the admin panel.")
 
+    elif action == "add_country_manual":
+        service = extra
+        if service not in services:
+            await update.message.reply_text("That service no longer exists.")
+            return True
+        if " " not in text:
+            await update.message.reply_text(
+                "Format: `Country Name RANGECODE` — try again from the admin panel.", parse_mode=ParseMode.MARKDOWN
+            )
+            return True
+        country, rng = text.rsplit(" ", 1)
+        services[service][country.strip()] = rng.strip()
+        save_services()
+        await update.message.reply_text(
+            f"✅ Added {country.strip()} → `{rng.strip()}` under {service}.", parse_mode=ParseMode.MARKDOWN
+        )
+
     return True
 
 
@@ -737,6 +964,16 @@ def main():
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
     app.add_error_handler(global_error_handler)
+
+    if app.job_queue is None:
+        print(
+            "⚠️  JobQueue not available — background auto-sync will NOT run.\n"
+            "    Install it with: pip install \"python-telegram-bot[job-queue]\""
+        )
+    else:
+        schedule_autosync_job(app.job_queue)
+        state = "ON" if AUTOSYNC_ENABLED else "OFF"
+        print(f"Background auto-sync {state}, every {AUTOSYNC_INTERVAL_SECONDS // 60} min.")
 
     print("Bot running...")
     app.run_polling()
