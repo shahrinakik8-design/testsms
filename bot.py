@@ -4,9 +4,10 @@ Zebra SMS Telegram Bot — bottom keyboard UI + admin service/country manager.
 
 Setup:
     pip install -r requirements.txt
-    export TELEGRAM_BOT_TOKEN="8821322242:AAFiDVoQewpGhHAR40mGXkOLd1ksjVdua9E"
-    export ADMIN_IDS="1586853120,22222222"   # your numeric Telegram user id(s)
+    export TELEGRAM_BOT_TOKEN="123456:ABC-your-bot-father-token"
+    export ADMIN_IDS="111111111,222222222"   # your numeric Telegram user id(s)
     python3 bot.py
+
 Find your Telegram user id via @userinfobot.
 
 Admin can define "services" (e.g. Facebook, Instagram) and, under each
@@ -152,7 +153,11 @@ def save_services():
 
 def _call_sync(method, path, **kwargs):
     resp = requests.request(method, f"{BASE_URL}{path}", headers=HEADERS, timeout=15, **kwargs)
-    data = resp.json()
+    try:
+        data = resp.json()
+    except ValueError:
+        snippet = resp.text[:200].strip() or "(empty response)"
+        raise RuntimeError(f"API returned a non-JSON response (HTTP {resp.status_code}): {snippet}")
     meta = data.get("meta", {})
     if meta.get("code") != 0:
         raise RuntimeError(meta.get("error") or f"API error {meta.get('code')}")
