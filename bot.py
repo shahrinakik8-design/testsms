@@ -42,7 +42,7 @@ from telegram.ext import (
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("zebra_bot")
 
-BASE_URL = "https://zebrasms.com/api/v1"
+BASE_URL = "https://api.zebrasms.com/api/v1"
 API_KEY = "6U3G3DDZ6GB"
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 ADMIN_IDS = {int(x) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
