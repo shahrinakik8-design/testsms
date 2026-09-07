@@ -6,6 +6,7 @@ Setup:
     pip install -r requirements.txt
     export TELEGRAM_BOT_TOKEN="123456:ABC-your-bot-father-token"
     export ADMIN_IDS="111111111,222222222"   # your numeric Telegram user id(s)
+    export ZEBRA_API_KEY="your-zebra-api-key"   # recommended: keep this out of source
     python3 bot.py
 
 Find your Telegram user id via @userinfobot.
@@ -43,10 +44,15 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 logger = logging.getLogger("zebra_bot")
 
 BASE_URL = "https://api.zebrasms.com/api/v1"
-API_KEY = "6U3G3DDZ6GB"
+# Prefer an env var so the key isn't sitting in source control. Falls back to
+# the value that used to be hardcoded here so nothing breaks if you haven't
+# set ZEBRA_API_KEY yet — but you should set it, and regenerate the key on
+# Zebra's dashboard if this file was ever shared/committed anywhere.
+API_KEY = os.environ.get("ZEBRA_API_KEY", "6U3G3DDZ6GB")
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 ADMIN_IDS = {int(x) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
 
+# Per the docs: send MAuth and no other auth header.
 HEADERS = {"MAuth": API_KEY, "Content-Type": "application/json"}
 
 DATA_DIR = os.environ.get("DATA_DIR", os.path.dirname(os.path.abspath(__file__)))
@@ -151,6 +157,16 @@ def save_services():
 
 # ── API helpers ──────────────────────────────────────────────────────────
 
+# Human-readable fallback labels for the documented error codes, used when
+# the API doesn't give us a specific "message" to show.
+_ERROR_LABELS = {
+    -101: "Bad request",
+    -102: "Unauthorized — API key missing, unknown, disabled, or account not active",
+    -103: "Forbidden — not a dialer account, or the feature is switched off right now",
+    -500: "Server error on Zebra's side — please retry in a moment",
+}
+
+
 def _call_sync(method, path, **kwargs):
     resp = requests.request(method, f"{BASE_URL}{path}", headers=HEADERS, timeout=15, **kwargs)
     try:
@@ -158,9 +174,19 @@ def _call_sync(method, path, **kwargs):
     except ValueError:
         snippet = resp.text[:200].strip() or "(empty response)"
         raise RuntimeError(f"API returned a non-JSON response (HTTP {resp.status_code}): {snippet}")
+
     meta = data.get("meta", {})
-    if meta.get("code") != 0:
-        raise RuntimeError(meta.get("error") or f"API error {meta.get('code')}")
+    code = meta.get("code")
+    if code != 0:
+        # Per the docs, "message says what [was wrong]" — the descriptive
+        # text lives in the top-level "message" field. meta.error is often
+        # just the short code name (e.g. "BAD_REQUEST"), which isn't very
+        # actionable on its own, so we lead with "message" when present.
+        detail = (data.get("message") or "").strip()
+        label = _ERROR_LABELS.get(code, meta.get("error") or f"API error {code}")
+        if detail:
+            raise RuntimeError(f"{label}: {detail}")
+        raise RuntimeError(label)
     return data.get("data")
 
 
@@ -525,6 +551,7 @@ def services_menu_kb():
         [InlineKeyboardButton("➕ Add Service", callback_data="adm:svc_add")],
         [InlineKeyboardButton("🌍 Add Country to Service", callback_data="adm:svc_addcountry")],
         [InlineKeyboardButton("🔄 Auto-Sync From Live Console", callback_data="adm:svc_autosync")],
+        [InlineKeyboardButton("🧹 Clean Stale Ranges", callback_data="adm:svc_cleanstale")],
         [InlineKeyboardButton("⏱ Auto-Sync Settings", callback_data="adm:autosync_settings")],
         [InlineKeyboardButton("📋 List Services", callback_data="adm:svc_list")],
         [InlineKeyboardButton("🗑 Remove Service", callback_data="adm:svc_remove")],
@@ -538,7 +565,14 @@ def sync_service_with_live_rows(service, rows):
     /publicapi/liveaccess) into `services[service]`, auto-guessing the
     country from the range prefix. Existing ranges are left untouched;
     name clashes get a numeric suffix. Returns a stats dict and the list
-    of (country, range) pairs that were newly added."""
+    of (country, range) pairs that were newly added.
+
+    NOTE: this only ADDS. It deliberately does not remove ranges that have
+    dropped out of the current live snapshot, because liveaccess reflects
+    recent activity, not a strict allow-list — a manually-entered range you
+    know is good might just not be "live" this minute. Use the admin
+    "Clean Stale Ranges" action if you want to prune dead ones; that shows
+    a preview and asks for confirmation before deleting anything."""
     if service not in services:
         return None, []
 
@@ -606,9 +640,83 @@ async def auto_sync_service(query, service):
         f"➕ Added: {stats['added']}\n"
         f"⏭ Already present: {stats['skipped_existing']}\n"
         f"❓ Unknown country (labeled by range): {stats['unknown']}\n\n"
-        f"Total live ranges seen: {stats['total_seen']}"
+        f"Total live ranges seen: {stats['total_seen']}\n\n"
+        f"_Tip: if \"Get Number\" gives BAD_REQUEST for an old entry, run "
+        f"🧹 Clean Stale Ranges below._"
     )
     await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=services_menu_kb())
+
+
+# ── Stale-range cleanup (preview + confirm, never auto-deletes) ────────
+
+async def show_stale_preview(query, service):
+    if service not in services:
+        await query.edit_message_text("That service no longer exists.", reply_markup=services_menu_kb())
+        return
+
+    await query.edit_message_text(f"🧹 Checking *{service}* against the live console...", parse_mode=ParseMode.MARKDOWN)
+
+    try:
+        data = await api_call("GET", "/publicapi/liveaccess")
+    except Exception as e:
+        await query.edit_message_text(f"⚠️ Error: {e}", reply_markup=services_menu_kb())
+        return
+
+    live_ranges = set()
+    for r in data.get("rows", []):
+        live_ranges.update(r.get("ranges", []))
+
+    bucket = services[service]
+    stale = {c: rng for c, rng in bucket.items() if rng not in live_ranges}
+
+    if not stale:
+        await query.edit_message_text(
+            f"✅ *{service}* — every mapped range is currently live. Nothing to clean.",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=services_menu_kb(),
+        )
+        return
+
+    chat_id = query.message.chat_id
+    ADMIN_STATE[chat_id] = ("cleanstale_pending", (service, list(stale.keys())))
+
+    lines = "\n".join(f"  • {c} — `{r}`" for c, r in list(stale.items())[:20])
+    more = f"\n  …and {len(stale) - 20} more" if len(stale) > 20 else ""
+    text = (
+        f"🧹 *{len(stale)} stale range(s) in {service}*\n"
+        f"(not in the current live list — allocating from these will likely "
+        f"return BAD_REQUEST):\n\n{lines}{more}\n\n"
+        f"Remove them?"
+    )
+    buttons = [
+        [InlineKeyboardButton("✅ Remove all listed", callback_data=f"adm:cleanstale_go:{service}")],
+        [InlineKeyboardButton("⬅️ Cancel", callback_data="adm:services")],
+    ]
+    await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup(buttons))
+
+
+async def confirm_clean_stale(query, service):
+    chat_id = query.message.chat_id
+    state = ADMIN_STATE.pop(chat_id, None)
+    if not state or state[0] != "cleanstale_pending" or state[1][0] != service:
+        await query.edit_message_text(
+            "That cleanup request expired — run it again from the menu.", reply_markup=services_menu_kb()
+        )
+        return
+
+    _, countries = state[1]
+    bucket = services.get(service, {})
+    removed = 0
+    for country in countries:
+        if bucket.pop(country, None) is not None:
+            removed += 1
+    save_services()
+
+    await query.edit_message_text(
+        f"🧹 Removed {removed} stale range(s) from *{service}*.",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=services_menu_kb(),
+    )
 
 
 # ── Periodic background sync (every AUTOSYNC_INTERVAL_SECONDS) ─────────
@@ -690,7 +798,8 @@ async def show_autosync_settings(query):
         f"Interval: every {AUTOSYNC_INTERVAL_SECONDS // 60} min\n\n"
         f"When on, the bot checks the live console every "
         f"{AUTOSYNC_INTERVAL_SECONDS // 60} minutes and merges any new "
-        f"range into every configured service automatically. Admins get a "
+        f"range into every configured service automatically (it only adds — "
+        f"use 🧹 Clean Stale Ranges to prune dead ones). Admins get a "
         f"message only when something new is actually found."
     )
     buttons = [
@@ -771,6 +880,17 @@ async def admin_callback_router(update: Update, context: ContextTypes.DEFAULT_TY
             reply_markup=InlineKeyboardMarkup(buttons),
         )
 
+    elif data == "adm:svc_cleanstale":
+        if not services:
+            await query.edit_message_text("No services yet — add one first.", reply_markup=services_menu_kb())
+            return
+        buttons = [[InlineKeyboardButton(name, callback_data=f"adm:cleanstale:{name}")] for name in services.keys()]
+        buttons.append([InlineKeyboardButton("⬅️ Back", callback_data="adm:services")])
+        await query.edit_message_text(
+            "🧹 Pick a service to check for stale (no-longer-live) ranges:",
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+
     elif data.startswith("adm:autosync:"):
         service = data.split(":", 2)[2]
         await auto_sync_service(query, service)
@@ -780,6 +900,14 @@ async def admin_callback_router(update: Update, context: ContextTypes.DEFAULT_TY
 
     elif data == "adm:autosync_toggle":
         await toggle_autosync(query, context)
+
+    elif data.startswith("adm:cleanstale_go:"):
+        service = data.split(":", 2)[2]
+        await confirm_clean_stale(query, service)
+
+    elif data.startswith("adm:cleanstale:"):
+        service = data.split(":", 2)[2]
+        await show_stale_preview(query, service)
 
     elif data.startswith("adm:svcpick:"):
         service = data.split(":", 2)[2]
@@ -804,7 +932,6 @@ async def admin_callback_router(update: Update, context: ContextTypes.DEFAULT_TY
             return
         country = guess_country_from_range(rng) or rng  # fall back to the range itself if unknown
         # avoid silently overwriting a different range already saved under the same country name
-        suffix = ""
         base_country = country
         n = 2
         while country in services[service] and services[service][country] != rng:
@@ -854,7 +981,13 @@ async def admin_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if chat_id not in ADMIN_STATE:
         return False  # not handled here
 
-    action, extra = ADMIN_STATE.pop(chat_id)
+    action, extra = ADMIN_STATE[chat_id]
+    if action not in ("broadcast", "add_service", "add_country_manual"):
+        # A button-driven state (e.g. a pending stale-cleanup confirmation)
+        # — an unrelated text message shouldn't clear or hijack it.
+        return False
+
+    ADMIN_STATE.pop(chat_id, None)
     text = update.message.text.strip()
 
     if action == "broadcast":
@@ -947,6 +1080,9 @@ def main():
         raise SystemExit("Set TELEGRAM_BOT_TOKEN first.")
     if not ADMIN_IDS:
         print("⚠️  No ADMIN_IDS set — the Admin button/menu will be unusable until you set that env var.")
+    if not os.environ.get("ZEBRA_API_KEY"):
+        print("⚠️  ZEBRA_API_KEY not set — using the key baked into this file. Set the env var and "
+              "regenerate the key on Zebra's dashboard if this file has ever been shared or committed.")
 
     load_services()
 
