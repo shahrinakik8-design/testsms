@@ -7,7 +7,6 @@ Setup:
     export TELEGRAM_BOT_TOKEN="8821322242:AAFiDVoQewpGhHAR40mGXkOLd1ksjVdua9E"
     export ADMIN_IDS="1586853120,22222222"   # your numeric Telegram user id(s)
     python3 bot.py
-    
 Find your Telegram user id via @userinfobot.
 
 Admin can define "services" (e.g. Facebook, Instagram) and, under each
@@ -25,6 +24,8 @@ import os
 import json
 import time
 import asyncio
+import logging
+import traceback
 import requests
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
 from telegram.constants import ParseMode
@@ -36,6 +37,9 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+logger = logging.getLogger("zebra_bot")
 
 BASE_URL = "https://zebrasms.com/api/v1"
 API_KEY = "6U3G3DDZ6GB"
@@ -255,7 +259,7 @@ async def service_callback_router(update: Update, context: ContextTypes.DEFAULT_
 async def show_sender_list(update_or_query, edit=False):
     try:
         data = await api_call("GET", "/publicapi/liveaccess")
-    except RuntimeError as e:
+    except Exception as e:
         text = f"⚠️ Error: {e}"
         if edit:
             await update_or_query.edit_message_text(text)
@@ -285,7 +289,7 @@ async def show_sender_list(update_or_query, edit=False):
 async def show_ranges_for_sender(query, sender):
     try:
         data = await api_call("GET", "/publicapi/liveaccess", params={"sender": sender})
-    except RuntimeError as e:
+    except Exception as e:
         await query.edit_message_text(f"⚠️ Error: {e}", reply_markup=back_inline())
         return
     rows = data.get("rows", [])
@@ -340,7 +344,7 @@ async def start_getnum_flow(chat_id, rng, context, edit_query=None, label=None):
 
     try:
         data = await api_call("POST", "/publicapi/getnum", json={"range": rng})
-    except RuntimeError as e:
+    except Exception as e:
         msg = f"⚠️ Error: {e}"
         if edit_query:
             await edit_query.edit_message_text(msg)
@@ -394,7 +398,7 @@ async def _wait_for_code(chat_id, number, expires_ms, context):
                 return
             try:
                 data = await api_call("GET", "/publicapi/getupdate")
-            except RuntimeError as e:
+            except Exception as e:
                 await context.bot.send_message(chat_id, f"⚠️ Error polling for code: {e}")
                 return
 
@@ -430,7 +434,7 @@ async def codes_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     KNOWN_USERS.add(update.effective_chat.id)
     try:
         data = await api_call("GET", "/publicapi/getupdate")
-    except RuntimeError as e:
+    except Exception as e:
         await update.message.reply_text(f"⚠️ Error: {e}")
         return
     rows = data.get("rows", [])[:15]
@@ -465,7 +469,7 @@ def admin_menu_kb():
 async def show_admin_sender_list(query, service):
     try:
         data = await api_call("GET", "/publicapi/liveaccess")
-    except RuntimeError as e:
+    except Exception as e:
         await query.edit_message_text(f"⚠️ Error: {e}", reply_markup=services_menu_kb())
         return
     rows = data.get("rows", [])
@@ -485,7 +489,7 @@ async def show_admin_sender_list(query, service):
 async def show_admin_ranges_for_sender(query, service, sender):
     try:
         data = await api_call("GET", "/publicapi/liveaccess", params={"sender": sender})
-    except RuntimeError as e:
+    except Exception as e:
         await query.edit_message_text(f"⚠️ Error: {e}", reply_markup=services_menu_kb())
         return
     rows = data.get("rows", [])
@@ -686,6 +690,26 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ── Wiring ───────────────────────────────────────────────────────────────
 
+async def global_error_handler(update, context: ContextTypes.DEFAULT_TYPE):
+    """Logs the full traceback and, where possible, tells the user something went wrong
+    instead of leaving them staring at a button that did nothing."""
+    logger.error("Unhandled exception:\n%s", "".join(traceback.format_exception(None, context.error, context.error.__traceback__)))
+
+    chat_id = None
+    try:
+        if isinstance(update, Update):
+            if update.effective_chat:
+                chat_id = update.effective_chat.id
+    except Exception:
+        pass
+
+    if chat_id is not None:
+        try:
+            await context.bot.send_message(chat_id, "⚠️ Something went wrong handling that. Please try again.")
+        except Exception:
+            pass
+
+
 def main():
     if not BOT_TOKEN:
         raise SystemExit("Set TELEGRAM_BOT_TOKEN first.")
@@ -707,6 +731,7 @@ def main():
     app.add_handler(CallbackQueryHandler(raw_callback_router, pattern=r"^(sender:|getnum:)"))
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
+    app.add_error_handler(global_error_handler)
 
     print("Bot running...")
     app.run_polling()
