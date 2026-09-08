@@ -26,6 +26,7 @@ import json
 import time
 import asyncio
 import logging
+import secrets
 import traceback
 import requests
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
@@ -58,9 +59,12 @@ DATA_DIR = os.environ.get("DATA_DIR", os.path.dirname(os.path.abspath(__file__))
 SERVICES_FILE = os.path.join(DATA_DIR, "services.json")
 
 ACTIVE_TASKS = {}          # chat_id -> asyncio.Task waiting for a code
+ACTIVE_MSG = {}            # chat_id -> message_id of the "waiting for code" message (edited in place)
 KNOWN_USERS = set()        # chat_ids that have started the bot (in-memory only)
 NUMBERS_ALLOCATED = 0
 ADMIN_STATE = {}           # admin chat_id -> ("action_name", extra_data)
+USER_STATE = {}            # user chat_id -> "await_custom_range" (simple one-step flows)
+REPEAT_CACHE = {}          # short token -> (range, label), used by the "🔁 Get Another Number" button
 
 # services = { "Facebook": { "Ivory Coast": "22501XXX", ... }, ... }
 services = {}
@@ -187,7 +191,11 @@ def is_admin(user_id):
 
 # ── Bottom (persistent) keyboard ────────────────────────────────────────
 
-USER_ROWS = [["📱 Get Number", "📡 Browse Ranges"], ["📨 My Codes", "ℹ️ Help"]]
+USER_ROWS = [
+    ["📱 Get Number", "✏️ Custom Range"],
+    ["📡 Browse Ranges", "📨 My Codes"],
+    ["ℹ️ Help"],
+]
 
 
 def main_kb(user_id):
@@ -204,8 +212,13 @@ def back_inline(target="noop"):
 # ── /start ───────────────────────────────────────────────────────────────
 
 WELCOME = (
-    "👋 *Zebra SMS Bot*\n\n"
-    "Grab a virtual number and receive its verification code, right here.\n\n"
+    "👋 *Welcome to Zebra SMS Bot* 🦓📲\n\n"
+    "Grab a virtual number and receive its verification code, right here — "
+    "instantly, and without leaving Telegram.\n\n"
+    "✨ *What you can do:*\n"
+    "📱 Get a number from a ready-made service/country list\n"
+    "✏️ Or drop in your own custom range code\n"
+    "🔁 Get another number from the same range in one tap\n\n"
     "Use the buttons below 👇"
 )
 
@@ -348,6 +361,22 @@ async def getnum_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await start_getnum_flow(chat_id, context.args[0], context)
 
 
+def _remember_repeat(rng, label):
+    """Cache (range, label) under a short token so the '🔁 Get Another Number'
+    button can re-trigger the exact same range without re-encoding it into the
+    callback_data (which has a strict length limit). Capped so it can't grow
+    forever on a long-running bot."""
+    if len(REPEAT_CACHE) > 2000:
+        REPEAT_CACHE.clear()
+    token = secrets.token_hex(4)
+    REPEAT_CACHE[token] = (rng, label)
+    return token
+
+
+def _again_kb(token):
+    return InlineKeyboardMarkup([[InlineKeyboardButton("🔁 Get Another Number", callback_data=f"again:{token}")]])
+
+
 async def start_getnum_flow(chat_id, rng, context, edit_query=None, label=None):
     global NUMBERS_ALLOCATED
 
@@ -384,35 +413,56 @@ async def start_getnum_flow(chat_id, rng, context, edit_query=None, label=None):
     expires_str = time.strftime("%H:%M:%S", time.localtime(expires_ms / 1000))
     NUMBERS_ALLOCATED += 1
 
-    header = f"🏷 {label}\n" if label else ""
+    header = f"🏷 *{label}*\n" if label else ""
     text = (
-        f"{header}✅ *Allocated:* `{number}`\n"
+        f"{header}✅ *Number Allocated*\n"
+        f"━━━━━━━━━━━━━━━\n"
+        f"📞 `{number}`\n"
         f"🌍 {row['country']} / {row['operator']}\n"
-        f"⏰ Expires at {expires_str}\n\n"
-        f"⌛ Waiting for the code... (/cancel to stop)"
+        f"⏰ Expires at {expires_str}\n"
+        f"━━━━━━━━━━━━━━━\n"
+        f"⌛ Waiting for the SMS code... (/cancel to stop)"
     )
     if edit_query:
         await edit_query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN)
+        message_id = edit_query.message.message_id
     else:
-        await context.bot.send_message(chat_id, text, parse_mode=ParseMode.MARKDOWN)
+        sent = await context.bot.send_message(chat_id, text, parse_mode=ParseMode.MARKDOWN)
+        message_id = sent.message_id
 
-    task = asyncio.create_task(_wait_for_code(chat_id, number, expires_ms, context))
+    ACTIVE_MSG[chat_id] = message_id
+    token = _remember_repeat(rng, label)
+
+    task = asyncio.create_task(_wait_for_code(chat_id, number, expires_ms, context, message_id, token))
     ACTIVE_TASKS[chat_id] = task
 
 
-async def _wait_for_code(chat_id, number, expires_ms, context):
+async def _wait_for_code(chat_id, number, expires_ms, context, message_id, token):
     try:
         seen_data = await api_call("GET", "/publicapi/getupdate")
         seen = {(r["number"], r["message"], r["at_ms"]) for r in seen_data.get("rows", [])}
     except RuntimeError:
         seen = set()
 
+    again_kb = _again_kb(token)
+
     try:
         while True:
             if int(time.time() * 1000) > expires_ms:
-                await context.bot.send_message(
-                    chat_id, f"⌛ `{number}` expired with no code received.", parse_mode=ParseMode.MARKDOWN
+                # Auto-vanish: the number disappears, replaced by a clean expiry
+                # notice + a one-tap way to grab a fresh number from the same range.
+                text = (
+                    f"⌛ *Expired*\n"
+                    f"No code arrived in time for that number.\n\n"
+                    f"Tap below to try again with the same range 👇"
                 )
+                try:
+                    await context.bot.edit_message_text(
+                        chat_id=chat_id, message_id=message_id, text=text,
+                        parse_mode=ParseMode.MARKDOWN, reply_markup=again_kb,
+                    )
+                except Exception:
+                    await context.bot.send_message(chat_id, text, parse_mode=ParseMode.MARKDOWN, reply_markup=again_kb)
                 return
             try:
                 data = await api_call("GET", "/publicapi/getupdate")
@@ -423,24 +473,62 @@ async def _wait_for_code(chat_id, number, expires_ms, context):
             for r in data.get("rows", []):
                 key = (r["number"], r["message"], r["at_ms"])
                 if r["number"] == number and key not in seen:
-                    await context.bot.send_message(
-                        chat_id,
-                        f"📨 *Code from {r['sender']}* on `{number}`:\n`{r['message']}`",
-                        parse_mode=ParseMode.MARKDOWN,
+                    # Auto-vanish: drop the number from view, show only the SMS
+                    # itself plus a one-tap way to grab another number.
+                    text = (
+                        f"📨 *New Code Received!*\n"
+                        f"━━━━━━━━━━━━━━━\n"
+                        f"`{r['message']}`\n"
+                        f"━━━━━━━━━━━━━━━\n"
+                        f"_from {r['sender']}_"
                     )
+                    try:
+                        await context.bot.edit_message_text(
+                            chat_id=chat_id, message_id=message_id, text=text,
+                            parse_mode=ParseMode.MARKDOWN, reply_markup=again_kb,
+                        )
+                    except Exception:
+                        await context.bot.send_message(chat_id, text, parse_mode=ParseMode.MARKDOWN, reply_markup=again_kb)
                     return
             await asyncio.sleep(3)
     except asyncio.CancelledError:
         return
     finally:
         ACTIVE_TASKS.pop(chat_id, None)
+        ACTIVE_MSG.pop(chat_id, None)
+
+
+async def again_callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles the '🔁 Get Another Number' button — re-runs the same range/label
+    the user just used, so they never have to re-navigate the service/country
+    menus just to grab a fresh number."""
+    query = update.callback_query
+    await query.answer()
+    chat_id = query.message.chat_id
+    KNOWN_USERS.add(chat_id)
+    token = query.data.split(":", 1)[1]
+    cached = REPEAT_CACHE.get(token)
+    if not cached:
+        await query.edit_message_text("⚠️ This shortcut expired — please start again from the menu.")
+        return
+    rng, label = cached
+    await start_getnum_flow(chat_id, rng, context, edit_query=query, label=label)
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
+    USER_STATE.pop(chat_id, None)
     task = ACTIVE_TASKS.get(chat_id)
     if task and not task.done():
         task.cancel()
+        message_id = ACTIVE_MSG.pop(chat_id, None)
+        if message_id:
+            try:
+                await context.bot.edit_message_text(
+                    chat_id=chat_id, message_id=message_id, text="🛑 Stopped waiting for the code."
+                )
+            except Exception:
+                pass
         await update.message.reply_text("🛑 Stopped waiting.")
     else:
         await update.message.reply_text("Nothing in progress.")
