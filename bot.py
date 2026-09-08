@@ -47,7 +47,12 @@ API_KEY = "6U3G3DDZ6GB"
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 ADMIN_IDS = {int(x) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
 
-HEADERS = {"MAuth": API_KEY, "Content-Type": "application/json"}
+HEADERS = {
+    "MAuth": API_KEY,
+    "Content-Type": "application/json",
+    "User-Agent": "curl/8.4.0",
+    "Accept": "*/*",
+}
 
 DATA_DIR = os.environ.get("DATA_DIR", os.path.dirname(os.path.abspath(__file__)))
 SERVICES_FILE = os.path.join(DATA_DIR, "services.json")
