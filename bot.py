@@ -160,7 +160,12 @@ def save_services():
 # ── API helpers ──────────────────────────────────────────────────────────
 
 def _call_sync(method, path, **kwargs):
-    resp = requests.request(method, f"{BASE_URL}{path}", headers=HEADERS, timeout=15, **kwargs)
+    url = f"{BASE_URL}{path}"
+    resp = requests.request(method, url, headers=HEADERS, timeout=15, **kwargs)
+    logger.info(
+        "Zebra API call: %s %s | body=%s | HTTP %s | response=%s",
+        method, url, kwargs.get("json") or kwargs.get("params"), resp.status_code, resp.text[:500],
+    )
     try:
         data = resp.json()
     except ValueError:
