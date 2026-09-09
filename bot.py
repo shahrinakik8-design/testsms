@@ -57,9 +57,29 @@ HEADERS = {
 
 DATA_DIR = os.environ.get("DATA_DIR", os.path.dirname(os.path.abspath(__file__)))
 SERVICES_FILE = os.path.join(DATA_DIR, "services.json")
+CONFIG_FILE = os.path.join(DATA_DIR, "config.json")
 
-ACTIVE_TASKS = {}          # chat_id -> asyncio.Task waiting for a code
-ACTIVE_STATUS_MSG = {}     # chat_id -> message_id of the "waiting for code" status message
+CONFIG = {"max_per_user": 1}
+
+
+def load_config():
+    global CONFIG
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                CONFIG.update(json.load(f))
+        except (json.JSONDecodeError, OSError):
+            pass
+
+
+def save_config():
+    try:
+        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(CONFIG, f, indent=2)
+    except OSError as e:
+        print(f"Could not save config.json: {e}")
+
+ACTIVE_NUMBERS = {}        # chat_id -> {number: {"task": Task, "message_id": int, "rng": str}}
 KNOWN_USERS = set()        # chat_ids that have started the bot (in-memory only)
 NUMBERS_ALLOCATED = 0
 ADMIN_STATE = {}           # admin chat_id -> ("action_name", extra_data)
@@ -344,10 +364,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ── Get Number by service + country ─────────────────────────────────────
 
-async def show_services(update_or_query, edit=False):
+async def show_services(update_or_query, edit=False, user_id=None):
     custom_btn = [InlineKeyboardButton("✍️ Custom Range", callback_data="customrange")]
+    visible_services = {
+        name: c for name, c in services.items() if name != AUTO_SERVICE_NAME or is_admin(user_id)
+    }
 
-    if not services:
+    if not visible_services:
         text = "No services configured yet. Enter a custom range yourself, or ask an admin to add a service."
         kb = InlineKeyboardMarkup([custom_btn])
         if edit:
@@ -356,7 +379,7 @@ async def show_services(update_or_query, edit=False):
             await update_or_query.message.reply_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
         return
 
-    buttons = [[InlineKeyboardButton(name, callback_data=f"svc:{name}")] for name in services.keys()]
+    buttons = [[InlineKeyboardButton(name, callback_data=f"svc:{name}")] for name in visible_services.keys()]
     buttons.append(custom_btn)
     text = "📱 *Choose a service:*"
     if edit:
@@ -400,7 +423,7 @@ async def service_callback_router(update: Update, context: ContextTypes.DEFAULT_
         )
 
     elif data == "svcback":
-        await show_services(query, edit=True)
+        await show_services(query, edit=True, user_id=query.from_user.id)
 
     elif data.startswith("svc:"):
         service = data.split(":", 1)[1]
@@ -494,9 +517,13 @@ async def getnum_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def start_getnum_flow(chat_id, rng, context, edit_query=None, label=None):
     global NUMBERS_ALLOCATED
 
-    existing = ACTIVE_TASKS.get(chat_id)
-    if existing and not existing.done():
-        msg = "⏳ Already waiting on a number — send /cancel first."
+    active = ACTIVE_NUMBERS.setdefault(chat_id, {})
+    active = {num: info for num, info in active.items() if not info["task"].done()}
+    ACTIVE_NUMBERS[chat_id] = active
+
+    limit = CONFIG.get("max_per_user", 1)
+    if len(active) >= limit:
+        msg = f"⏳ You already have {limit} active number(s) — cancel one with /cancel first, or wait for it to finish."
         if edit_query:
             await edit_query.edit_message_text(msg)
         else:
@@ -527,10 +554,11 @@ async def start_getnum_flow(chat_id, rng, context, edit_query=None, label=None):
     expires_str = time.strftime("%H:%M:%S", time.localtime(expires_ms / 1000))
     NUMBERS_ALLOCATED += 1
 
-    header = f"🏷 {label}\n" if label else ""
+    header = f"🏷 *{label}*\n" if label else ""
     text = (
-        f"{header}✅ *Allocated:* `{number}`\n"
-        f"🌍 {row['country']} / {row['operator']}\n"
+        f"{header}✨ *NUMBER ALLOCATED* ✨\n\n"
+        f"📞 ```\n{number}\n```\n"
+        f"🌍 {row['country']} • {row['operator']}\n"
         f"⏰ Expires at {expires_str}\n\n"
         f"⌛ Waiting for the code... (/cancel to stop)"
     )
@@ -539,29 +567,36 @@ async def start_getnum_flow(chat_id, rng, context, edit_query=None, label=None):
     else:
         sent = await context.bot.send_message(chat_id, text, parse_mode=ParseMode.MARKDOWN)
 
-    # Remember this message so the final code (or expiry) can replace it in place,
-    # instead of piling up a separate new message underneath.
     message_id = getattr(sent, "message_id", None)
-    if message_id is not None:
-        ACTIVE_STATUS_MSG[chat_id] = message_id
 
     task = asyncio.create_task(_wait_for_code(chat_id, number, rng, expires_ms, context, label))
-    ACTIVE_TASKS[chat_id] = task
+    ACTIVE_NUMBERS[chat_id][number] = {"task": task, "message_id": message_id, "rng": rng}
 
 
-async def _update_status(chat_id, context, text, reply_markup=None):
-    """Edits the tracked status message in place if we have one, otherwise sends a new message."""
-    message_id = ACTIVE_STATUS_MSG.get(chat_id)
+async def _update_status(chat_id, number, context, text, reply_markup=None):
+    """Edits this number's tracked status message in place if we have one."""
+    info = ACTIVE_NUMBERS.get(chat_id, {}).get(number)
+    message_id = info["message_id"] if info else None
     if message_id is not None:
         try:
             await context.bot.edit_message_text(
                 chat_id=chat_id, message_id=message_id, text=text,
                 parse_mode=ParseMode.MARKDOWN, reply_markup=reply_markup,
             )
-            return
+            return message_id
         except Exception:
-            pass  # message may have been deleted/too old to edit — fall back to a new one
-    await context.bot.send_message(chat_id, text, parse_mode=ParseMode.MARKDOWN, reply_markup=reply_markup)
+            pass
+    sent = await context.bot.send_message(chat_id, text, parse_mode=ParseMode.MARKDOWN, reply_markup=reply_markup)
+    return getattr(sent, "message_id", None)
+
+
+async def _vanish_later(context, chat_id, message_id, delay=60):
+    """Deletes the given message after a delay, for a clean 'vanish' effect."""
+    await asyncio.sleep(delay)
+    try:
+        await context.bot.delete_message(chat_id, message_id)
+    except Exception:
+        pass
 
 
 async def _wait_for_code(chat_id, number, rng, expires_ms, context, label=None):
@@ -576,35 +611,37 @@ async def _wait_for_code(chat_id, number, rng, expires_ms, context, label=None):
     try:
         while True:
             if int(time.time() * 1000) > expires_ms:
-                await _update_status(chat_id, context, f"⌛ `{number}` expired with no code received.", reply_markup=again_kb)
+                await _update_status(chat_id, number, context, f"⌛ `{number}` expired with no code received.", reply_markup=again_kb)
                 return
             try:
                 data = await api_call("GET", "/publicapi/getupdate")
             except Exception as e:
-                await _update_status(chat_id, context, f"⚠️ Error polling for code: {e}")
+                await _update_status(chat_id, number, context, f"⚠️ Error polling for code: {e}")
                 return
 
             for r in data.get("rows", []):
                 key = (r["number"], r["message"], r["at_ms"])
                 if r["number"] == number and key not in seen:
                     code = extract_code(r["message"])
-                    header = f"🏷 {label}\n" if label else ""
-                    text = f"{header}📨 *Code from {r['sender']}* on `{number}`:\n{r['message']}"
+                    header = f"🏷 *{label}*\n" if label else ""
+                    text = f"{header}🎉 *SMS RECEIVED* 🎉\n\n📞 `{number}`\n💬 {r['message']}"
                     if code:
-                        text += f"\n\n*Code:* `{code}`"
-                    await _update_status(chat_id, context, text, reply_markup=again_kb)
-                    ACTIVE_STATUS_MSG.pop(chat_id, None)
+                        text += f"\n\n🔑 *CODE*\n```\n{code}\n```"
+                    msg_id = await _update_status(chat_id, number, context, text, reply_markup=again_kb)
 
                     group_text = f"📨 *{r['sender']}* — `{number}`\n{r['message']}"
                     if code:
                         group_text += f"\n*Code:* `{code}`"
                     await post_to_group(context, group_text)
+
+                    if msg_id is not None:
+                        asyncio.create_task(_vanish_later(context, chat_id, msg_id, delay=60))
                     return
             await asyncio.sleep(3)
     except asyncio.CancelledError:
         return
     finally:
-        ACTIVE_TASKS.pop(chat_id, None)
+        ACTIVE_NUMBERS.get(chat_id, {}).pop(number, None)
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -614,10 +651,10 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if USER_STATE.pop(chat_id, None) is not None:
         cleared = True
 
-    task = ACTIVE_TASKS.get(chat_id)
-    if task and not task.done():
-        task.cancel()
-        cleared = True
+    for number, info in list(ACTIVE_NUMBERS.get(chat_id, {}).items()):
+        if not info["task"].done():
+            info["task"].cancel()
+            cleared = True
 
     if cleared:
         await update.message.reply_text("🛑 Stopped / cancelled.")
@@ -680,6 +717,7 @@ def admin_menu_kb():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📊 Stats", callback_data="adm:stats")],
         [InlineKeyboardButton("🧩 Manage Services", callback_data="adm:services")],
+        [InlineKeyboardButton(f"🔢 Per-user limit: {CONFIG.get('max_per_user', 1)}", callback_data="adm:setlimit")],
         [InlineKeyboardButton("📢 Broadcast", callback_data="adm:broadcast")],
         [InlineKeyboardButton("⬅️ Close", callback_data="adm:close")],
     ])
@@ -868,7 +906,7 @@ async def admin_callback_router(update: Update, context: ContextTypes.DEFAULT_TY
         text = (
             "📊 *Stats*\n\n"
             f"👥 Known users: {len(KNOWN_USERS)}\n"
-            f"⌛ Active waits: {len(ACTIVE_TASKS)}\n"
+            f"⌛ Active waits: {sum(len(v) for v in ACTIVE_NUMBERS.values())}\n"
             f"📱 Numbers allocated this run: {NUMBERS_ALLOCATED}\n"
             f"🧩 Services configured: {len(services)}\n\n"
             "_Counts reset if the bot restarts (in-memory only)._"
@@ -878,6 +916,13 @@ async def admin_callback_router(update: Update, context: ContextTypes.DEFAULT_TY
     elif data == "adm:broadcast":
         ADMIN_STATE[chat_id] = ("broadcast", None)
         await query.edit_message_text("📢 Send the message to broadcast to all known users.\nSend /cancel to abort.")
+
+    elif data == "adm:setlimit":
+        ADMIN_STATE[chat_id] = ("set_limit", None)
+        await query.edit_message_text(
+            f"🔢 Current limit: {CONFIG.get('max_per_user', 1)} number(s) per user at a time.\n"
+            f"Send a new number to change it.\nSend /cancel to abort.",
+        )
 
     elif data == "adm:services":
         await query.edit_message_text("🧩 *Manage Services*", parse_mode=ParseMode.MARKDOWN, reply_markup=services_menu_kb())
@@ -988,6 +1033,14 @@ async def admin_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
             save_services()
             await update.message.reply_text(f"✅ Service '{text}' added. Now add countries to it from the admin panel.")
 
+    elif action == "set_limit":
+        if not text.isdigit() or int(text) < 1:
+            await update.message.reply_text("Send a whole number of 1 or more.")
+            return True
+        CONFIG["max_per_user"] = int(text)
+        save_config()
+        await update.message.reply_text(f"✅ Per-user limit set to {text}.")
+
     elif action == "add_country_manual":
         service = extra
         if service not in services:
@@ -1028,7 +1081,7 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
 
     if text == "📱 Get Number":
-        await show_services(update)
+        await show_services(update, user_id=update.effective_user.id)
     elif text == "📡 Browse Ranges":
         await show_sender_list(update)
     elif text == "📨 My Codes":
@@ -1071,6 +1124,7 @@ def main():
         print("⚠️  No ADMIN_IDS set — the Admin button/menu will be unusable until you set that env var.")
 
     load_services()
+    load_config()
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
