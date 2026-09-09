@@ -74,7 +74,7 @@ GROUP_LINK = os.environ.get("GROUP_LINK", "https://t.me/otpmastersgrp")
 services = {}
 
 AUTO_SERVICE_NAME = "🔎 Auto-Detected"
-AUTO_POLL_SECONDS = 300  # how often to check Zebra's liveaccess endpoint in the background
+AUTO_POLL_SECONDS = 10  # how often to check Zebra's liveaccess endpoint in the background
 
 # ── Calling-code -> country lookup (so country names fill in automatically) ─
 # Checked longest-prefix-first (3 digits, then 2, then 1) against the start
@@ -367,13 +367,17 @@ async def show_services(update_or_query, edit=False):
 
 async def show_countries(query, service):
     countries = services.get(service, {})
+    back_btn = InlineKeyboardButton("⬅️ Back", callback_data="svcback")
     if not countries:
-        await query.edit_message_text(f"No countries configured for {service} yet.", reply_markup=back_inline())
+        await query.edit_message_text(
+            f"No countries configured for {service} yet.", reply_markup=InlineKeyboardMarkup([[back_btn]])
+        )
         return
     buttons = [
         [InlineKeyboardButton(country, callback_data=f"svccountry:{service}:{country}")]
         for country in countries.keys()
     ]
+    buttons.append([back_btn])
     await query.edit_message_text(
         f"🌍 *{service}* — choose a country:",
         parse_mode=ParseMode.MARKDOWN,
@@ -394,6 +398,9 @@ async def service_callback_router(update: Update, context: ContextTypes.DEFAULT_
             "✍️ Send the range you want a number from, e.g. `22501XXX`.\nSend /cancel to abort.",
             parse_mode=ParseMode.MARKDOWN,
         )
+
+    elif data == "svcback":
+        await show_services(query, edit=True)
 
     elif data.startswith("svc:"):
         service = data.split(":", 1)[1]
@@ -819,12 +826,6 @@ async def auto_poll_liveaccess(context: ContextTypes.DEFAULT_TYPE):
     if newly_added:
         save_services()
         text = "🔎 *Auto-detected new range(s):*\n\n" + "\n".join(f"• {line}" for line in newly_added)
-        admin_text = text + f"\n\nSaved under *{AUTO_SERVICE_NAME}* — move them into a named service anytime from the admin panel."
-        for admin_id in ADMIN_IDS:
-            try:
-                await context.bot.send_message(admin_id, admin_text, parse_mode=ParseMode.MARKDOWN)
-            except Exception:
-                pass
         await post_to_group(context, text)
 
 
