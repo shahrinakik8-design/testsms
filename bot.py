@@ -22,11 +22,11 @@ directory if you need the service/country list to survive restarts.
 """
 
 import os
+import re
 import json
 import time
 import asyncio
 import logging
-import secrets
 import traceback
 import requests
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
@@ -59,12 +59,16 @@ DATA_DIR = os.environ.get("DATA_DIR", os.path.dirname(os.path.abspath(__file__))
 SERVICES_FILE = os.path.join(DATA_DIR, "services.json")
 
 ACTIVE_TASKS = {}          # chat_id -> asyncio.Task waiting for a code
-ACTIVE_MSG = {}            # chat_id -> message_id of the "waiting for code" message (edited in place)
+ACTIVE_STATUS_MSG = {}     # chat_id -> message_id of the "waiting for code" status message
 KNOWN_USERS = set()        # chat_ids that have started the bot (in-memory only)
 NUMBERS_ALLOCATED = 0
 ADMIN_STATE = {}           # admin chat_id -> ("action_name", extra_data)
-USER_STATE = {}            # user chat_id -> "await_custom_range" (simple one-step flows)
-REPEAT_CACHE = {}          # short token -> (range, label), used by the "🔁 Get Another Number" button
+USER_STATE = {}            # regular chat_id -> "awaiting_custom_range"
+SEEN_FEED_KEYS = set()     # (number, message, at_ms) already posted to the live-feed group
+FEED_POLL_SECONDS = 5      # getupdate is cached for 3s, so polling every 5s is cheap and safe
+
+GROUP_USERNAME = os.environ.get("GROUP_USERNAME", "-1004415108815")
+GROUP_LINK = os.environ.get("GROUP_LINK", "https://t.me/otpmastersgrp")
 
 # services = { "Facebook": { "Ivory Coast": "22501XXX", ... }, ... }
 services = {}
@@ -141,6 +145,102 @@ def guess_country_from_range(rng):
     return None
 
 
+# Country name -> ISO2, used only to render a flag emoji next to a country name.
+# Best-effort / not exhaustive — unknown countries just show without a flag.
+COUNTRY_TO_ISO2 = {
+    "USA/Canada": "US", "Russia/Kazakhstan": "RU", "Egypt": "EG", "South Africa": "ZA",
+    "Greece": "GR", "Netherlands": "NL", "Belgium": "BE", "France": "FR", "Spain": "ES",
+    "Hungary": "HU", "Italy": "IT", "Romania": "RO", "Switzerland": "CH", "Austria": "AT",
+    "United Kingdom": "GB", "Denmark": "DK", "Sweden": "SE", "Norway": "NO", "Poland": "PL",
+    "Germany": "DE", "Peru": "PE", "Mexico": "MX", "Cuba": "CU", "Argentina": "AR",
+    "Brazil": "BR", "Chile": "CL", "Colombia": "CO", "Venezuela": "VE", "Malaysia": "MY",
+    "Australia": "AU", "Indonesia": "ID", "Philippines": "PH", "New Zealand": "NZ",
+    "Singapore": "SG", "Thailand": "TH", "Japan": "JP", "South Korea": "KR", "Vietnam": "VN",
+    "China": "CN", "Turkey": "TR", "India": "IN", "Pakistan": "PK", "Afghanistan": "AF",
+    "Sri Lanka": "LK", "Myanmar": "MM", "Iran": "IR",
+    "South Sudan": "SS", "Morocco": "MA", "Algeria": "DZ", "Tunisia": "TN", "Libya": "LY",
+    "Gambia": "GM", "Senegal": "SN", "Mauritania": "MR", "Mali": "ML", "Guinea": "GN",
+    "Ivory Coast": "CI", "Burkina Faso": "BF", "Niger": "NE", "Togo": "TG", "Benin": "BJ",
+    "Mauritius": "MU", "Liberia": "LR", "Sierra Leone": "SL", "Ghana": "GH", "Nigeria": "NG",
+    "Chad": "TD", "Central African Republic": "CF", "Cameroon": "CM", "Cape Verde": "CV",
+    "Sao Tome and Principe": "ST", "Equatorial Guinea": "GQ", "Gabon": "GA",
+    "Republic of the Congo": "CG", "DR Congo": "CD", "Angola": "AO", "Guinea-Bissau": "GW",
+    "Seychelles": "SC", "Sudan": "SD", "Rwanda": "RW", "Ethiopia": "ET", "Somalia": "SO",
+    "Djibouti": "DJ", "Kenya": "KE", "Tanzania": "TZ", "Uganda": "UG", "Burundi": "BI",
+    "Mozambique": "MZ", "Zambia": "ZM", "Madagascar": "MG", "Reunion/Mayotte": "RE",
+    "Zimbabwe": "ZW", "Namibia": "NA", "Malawi": "MW", "Lesotho": "LS", "Botswana": "BW",
+    "Eswatini": "SZ", "Comoros": "KM", "Saint Helena": "SH", "Eritrea": "ER",
+    "Aruba": "AW", "Faroe Islands": "FO", "Greenland": "GL",
+    "Gibraltar": "GI", "Portugal": "PT", "Luxembourg": "LU", "Ireland": "IE",
+    "Iceland": "IS", "Albania": "AL", "Malta": "MT", "Cyprus": "CY", "Finland": "FI",
+    "Bulgaria": "BG", "Lithuania": "LT", "Latvia": "LV", "Estonia": "EE",
+    "Moldova": "MD", "Armenia": "AM", "Belarus": "BY", "Andorra": "AD",
+    "Monaco": "MC", "San Marino": "SM", "Ukraine": "UA", "Serbia": "RS",
+    "Montenegro": "ME", "Kosovo": "XK", "Croatia": "HR", "Slovenia": "SI",
+    "Bosnia and Herzegovina": "BA", "North Macedonia": "MK", "Czech Republic": "CZ",
+    "Slovakia": "SK", "Liechtenstein": "LI",
+    "Falkland Islands": "FK", "Belize": "BZ", "Guatemala": "GT", "El Salvador": "SV",
+    "Honduras": "HN", "Nicaragua": "NI", "Costa Rica": "CR", "Panama": "PA",
+    "Saint Pierre and Miquelon": "PM", "Haiti": "HT", "Guadeloupe": "GP",
+    "Bolivia": "BO", "Guyana": "GY", "Ecuador": "EC", "French Guiana": "GF",
+    "Paraguay": "PY", "Martinique": "MQ", "Suriname": "SR", "Uruguay": "UY",
+    "Curacao": "CW",
+    "East Timor": "TL", "Norfolk Island": "NF", "Brunei": "BN", "Nauru": "NR",
+    "Papua New Guinea": "PG", "Tonga": "TO", "Solomon Islands": "SB", "Vanuatu": "VU",
+    "Fiji": "FJ", "Palau": "PW", "Wallis and Futuna": "WF", "Cook Islands": "CK",
+    "Niue": "NU", "Samoa": "WS", "Kiribati": "KI", "New Caledonia": "NC",
+    "Tuvalu": "TV", "French Polynesia": "PF", "Tokelau": "TK", "Micronesia": "FM",
+    "Marshall Islands": "MH",
+    "North Korea": "KP", "Hong Kong": "HK", "Macau": "MO", "Cambodia": "KH",
+    "Laos": "LA", "Bangladesh": "BD", "Taiwan": "TW",
+    "Maldives": "MV", "Lebanon": "LB", "Jordan": "JO", "Syria": "SY", "Iraq": "IQ",
+    "Kuwait": "KW", "Saudi Arabia": "SA", "Yemen": "YE", "Oman": "OM",
+    "Palestine": "PS", "United Arab Emirates": "AE", "Israel": "IL", "Bahrain": "BH",
+    "Qatar": "QA", "Bhutan": "BT", "Mongolia": "MN", "Nepal": "NP", "Tajikistan": "TJ",
+    "Turkmenistan": "TM", "Azerbaijan": "AZ", "Georgia": "GE", "Kyrgyzstan": "KG",
+    "Uzbekistan": "UZ",
+}
+
+
+def flag_emoji(country_name):
+    iso2 = COUNTRY_TO_ISO2.get(country_name)
+    if not iso2 or len(iso2) != 2:
+        return ""
+    return "".join(chr(127397 + ord(ch)) for ch in iso2.upper())
+
+
+SERVICE_KEYWORDS = [
+    "facebook", "instagram", "whatsapp", "telegram", "google", "tiktok", "twitter",
+    "snapchat", "viber", "wechat", "uber", "paypal", "amazon", "netflix",
+    "microsoft", "apple", "spotify", "discord", "tinder", "line", "grab", "gojek",
+]
+
+
+def detect_service(message):
+    lower = message.lower()
+    for kw in SERVICE_KEYWORDS:
+        if kw in lower:
+            return kw.capitalize()
+    return None
+
+
+def find_known_range_for_country(country):
+    """Only returns a range if we've genuinely saved one for this country before
+    (via admin manual entry or auto-detection) — never fabricated, so it's always
+    safe to copy into Custom Range."""
+    for countries in services.values():
+        for name, rng in countries.items():
+            if name.split(" (")[0] == country:  # strip any "(2)" dedup suffix
+                return rng
+    return None
+
+
+def mask_code_in_message(message, code):
+    if not code:
+        return message
+    return message.replace(code, "*" * len(code))
+
+
 def load_services():
     global services
     if os.path.exists(SERVICES_FILE):
@@ -177,7 +277,7 @@ def _call_sync(method, path, **kwargs):
         raise RuntimeError(f"API returned a non-JSON response (HTTP {resp.status_code}): {snippet}")
     meta = data.get("meta", {})
     if meta.get("code") != 0:
-        raise RuntimeError(meta.get("error") or f"API error {meta.get('code')}")
+        raise RuntimeError(data.get("message") or meta.get("error") or f"API error {meta.get('code')}")
     return data.get("data")
 
 
@@ -189,13 +289,30 @@ def is_admin(user_id):
     return user_id in ADMIN_IDS
 
 
+def extract_code(message):
+    """Best-effort pull of just the OTP code out of a full SMS body, so we can
+    show it in its own copyable snippet instead of the whole message."""
+    match = re.search(r"\b\d{3,8}\b", message)
+    if match:
+        return match.group(0)
+    match = re.search(r"\b[A-Za-z0-9]{4,8}\b", message)
+    return match.group(0) if match else None
+
+
+async def post_to_group(context, text):
+    """Best-effort mirror of a message to the configured Telegram group.
+    Never raises — a failure here should never break the main flow."""
+    if not GROUP_USERNAME:
+        return
+    try:
+        await context.bot.send_message(GROUP_USERNAME, text, parse_mode=ParseMode.MARKDOWN)
+    except Exception as e:
+        logger.info("post_to_group failed: %s", e)
+
+
 # ── Bottom (persistent) keyboard ────────────────────────────────────────
 
-USER_ROWS = [
-    ["📱 Get Number", "✏️ Custom Range"],
-    ["📡 Browse Ranges", "📨 My Codes"],
-    ["ℹ️ Help"],
-]
+USER_ROWS = [["📱 Get Number", "📡 Browse Ranges"], ["📨 My Codes", "🔴 Live Feed"], ["ℹ️ Help"]]
 
 
 def main_kb(user_id):
@@ -212,13 +329,8 @@ def back_inline(target="noop"):
 # ── /start ───────────────────────────────────────────────────────────────
 
 WELCOME = (
-    "👋 *Welcome to Zebra SMS Bot* 🦓📲\n\n"
-    "Grab a virtual number and receive its verification code, right here — "
-    "instantly, and without leaving Telegram.\n\n"
-    "✨ *What you can do:*\n"
-    "📱 Get a number from a ready-made service/country list\n"
-    "✏️ Or drop in your own custom range code\n"
-    "🔁 Get another number from the same range in one tap\n\n"
+    "👋 *Zebra SMS Bot*\n\n"
+    "Grab a virtual number and receive its verification code, right here.\n\n"
     "Use the buttons below 👇"
 )
 
@@ -233,15 +345,19 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ── Get Number by service + country ─────────────────────────────────────
 
 async def show_services(update_or_query, edit=False):
+    custom_btn = [InlineKeyboardButton("✍️ Custom Range", callback_data="customrange")]
+
     if not services:
-        text = "No services configured yet. Ask an admin to add one, or use `/getnum <range>` directly."
+        text = "No services configured yet. Enter a custom range yourself, or ask an admin to add a service."
+        kb = InlineKeyboardMarkup([custom_btn])
         if edit:
-            await update_or_query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN)
+            await update_or_query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
         else:
-            await update_or_query.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+            await update_or_query.message.reply_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
         return
 
     buttons = [[InlineKeyboardButton(name, callback_data=f"svc:{name}")] for name in services.keys()]
+    buttons.append(custom_btn)
     text = "📱 *Choose a service:*"
     if edit:
         await update_or_query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup(buttons))
@@ -272,7 +388,14 @@ async def service_callback_router(update: Update, context: ContextTypes.DEFAULT_
     chat_id = query.message.chat_id
     KNOWN_USERS.add(chat_id)
 
-    if data.startswith("svc:"):
+    if data == "customrange":
+        USER_STATE[chat_id] = "awaiting_custom_range"
+        await query.edit_message_text(
+            "✍️ Send the range you want a number from, e.g. `22501XXX`.\nSend /cancel to abort.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+
+    elif data.startswith("svc:"):
         service = data.split(":", 1)[1]
         await show_countries(query, service)
 
@@ -361,22 +484,6 @@ async def getnum_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await start_getnum_flow(chat_id, context.args[0], context)
 
 
-def _remember_repeat(rng, label):
-    """Cache (range, label) under a short token so the '🔁 Get Another Number'
-    button can re-trigger the exact same range without re-encoding it into the
-    callback_data (which has a strict length limit). Capped so it can't grow
-    forever on a long-running bot."""
-    if len(REPEAT_CACHE) > 2000:
-        REPEAT_CACHE.clear()
-    token = secrets.token_hex(4)
-    REPEAT_CACHE[token] = (rng, label)
-    return token
-
-
-def _again_kb(token):
-    return InlineKeyboardMarkup([[InlineKeyboardButton("🔁 Get Another Number", callback_data=f"again:{token}")]])
-
-
 async def start_getnum_flow(chat_id, rng, context, edit_query=None, label=None):
     global NUMBERS_ALLOCATED
 
@@ -413,123 +520,100 @@ async def start_getnum_flow(chat_id, rng, context, edit_query=None, label=None):
     expires_str = time.strftime("%H:%M:%S", time.localtime(expires_ms / 1000))
     NUMBERS_ALLOCATED += 1
 
-    header = f"🏷 *{label}*\n" if label else ""
+    header = f"🏷 {label}\n" if label else ""
     text = (
-        f"{header}✅ *Number Allocated*\n"
-        f"━━━━━━━━━━━━━━━\n"
-        f"📞 `{number}`\n"
+        f"{header}✅ *Allocated:* `{number}`\n"
         f"🌍 {row['country']} / {row['operator']}\n"
-        f"⏰ Expires at {expires_str}\n"
-        f"━━━━━━━━━━━━━━━\n"
-        f"⌛ Waiting for the SMS code... (/cancel to stop)"
+        f"⏰ Expires at {expires_str}\n\n"
+        f"⌛ Waiting for the code... (/cancel to stop)"
     )
     if edit_query:
-        await edit_query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN)
-        message_id = edit_query.message.message_id
+        sent = await edit_query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN)
     else:
         sent = await context.bot.send_message(chat_id, text, parse_mode=ParseMode.MARKDOWN)
-        message_id = sent.message_id
 
-    ACTIVE_MSG[chat_id] = message_id
-    token = _remember_repeat(rng, label)
+    # Remember this message so the final code (or expiry) can replace it in place,
+    # instead of piling up a separate new message underneath.
+    message_id = getattr(sent, "message_id", None)
+    if message_id is not None:
+        ACTIVE_STATUS_MSG[chat_id] = message_id
 
-    task = asyncio.create_task(_wait_for_code(chat_id, number, expires_ms, context, message_id, token))
+    task = asyncio.create_task(_wait_for_code(chat_id, number, rng, expires_ms, context, label))
     ACTIVE_TASKS[chat_id] = task
 
 
-async def _wait_for_code(chat_id, number, expires_ms, context, message_id, token):
+async def _update_status(chat_id, context, text, reply_markup=None):
+    """Edits the tracked status message in place if we have one, otherwise sends a new message."""
+    message_id = ACTIVE_STATUS_MSG.get(chat_id)
+    if message_id is not None:
+        try:
+            await context.bot.edit_message_text(
+                chat_id=chat_id, message_id=message_id, text=text,
+                parse_mode=ParseMode.MARKDOWN, reply_markup=reply_markup,
+            )
+            return
+        except Exception:
+            pass  # message may have been deleted/too old to edit — fall back to a new one
+    await context.bot.send_message(chat_id, text, parse_mode=ParseMode.MARKDOWN, reply_markup=reply_markup)
+
+
+async def _wait_for_code(chat_id, number, rng, expires_ms, context, label=None):
     try:
         seen_data = await api_call("GET", "/publicapi/getupdate")
         seen = {(r["number"], r["message"], r["at_ms"]) for r in seen_data.get("rows", [])}
-    except RuntimeError:
+    except Exception:
         seen = set()
 
-    again_kb = _again_kb(token)
+    again_kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔁 Get Another (same range)", callback_data=f"getnum:{rng}")]])
 
     try:
         while True:
             if int(time.time() * 1000) > expires_ms:
-                # Auto-vanish: the number disappears, replaced by a clean expiry
-                # notice + a one-tap way to grab a fresh number from the same range.
-                text = (
-                    f"⌛ *Expired*\n"
-                    f"No code arrived in time for that number.\n\n"
-                    f"Tap below to try again with the same range 👇"
-                )
-                try:
-                    await context.bot.edit_message_text(
-                        chat_id=chat_id, message_id=message_id, text=text,
-                        parse_mode=ParseMode.MARKDOWN, reply_markup=again_kb,
-                    )
-                except Exception:
-                    await context.bot.send_message(chat_id, text, parse_mode=ParseMode.MARKDOWN, reply_markup=again_kb)
+                await _update_status(chat_id, context, f"⌛ `{number}` expired with no code received.", reply_markup=again_kb)
                 return
             try:
                 data = await api_call("GET", "/publicapi/getupdate")
             except Exception as e:
-                await context.bot.send_message(chat_id, f"⚠️ Error polling for code: {e}")
+                await _update_status(chat_id, context, f"⚠️ Error polling for code: {e}")
                 return
 
             for r in data.get("rows", []):
                 key = (r["number"], r["message"], r["at_ms"])
                 if r["number"] == number and key not in seen:
-                    # Auto-vanish: drop the number from view, show only the SMS
-                    # itself plus a one-tap way to grab another number.
-                    text = (
-                        f"📨 *New Code Received!*\n"
-                        f"━━━━━━━━━━━━━━━\n"
-                        f"`{r['message']}`\n"
-                        f"━━━━━━━━━━━━━━━\n"
-                        f"_from {r['sender']}_"
-                    )
-                    try:
-                        await context.bot.edit_message_text(
-                            chat_id=chat_id, message_id=message_id, text=text,
-                            parse_mode=ParseMode.MARKDOWN, reply_markup=again_kb,
-                        )
-                    except Exception:
-                        await context.bot.send_message(chat_id, text, parse_mode=ParseMode.MARKDOWN, reply_markup=again_kb)
+                    code = extract_code(r["message"])
+                    header = f"🏷 {label}\n" if label else ""
+                    text = f"{header}📨 *Code from {r['sender']}* on `{number}`:\n{r['message']}"
+                    if code:
+                        text += f"\n\n*Code:* `{code}`"
+                    await _update_status(chat_id, context, text, reply_markup=again_kb)
+                    ACTIVE_STATUS_MSG.pop(chat_id, None)
+
+                    group_text = f"📨 *{r['sender']}* — `{number}`\n{r['message']}"
+                    if code:
+                        group_text += f"\n*Code:* `{code}`"
+                    await post_to_group(context, group_text)
                     return
             await asyncio.sleep(3)
     except asyncio.CancelledError:
         return
     finally:
         ACTIVE_TASKS.pop(chat_id, None)
-        ACTIVE_MSG.pop(chat_id, None)
-
-
-async def again_callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handles the '🔁 Get Another Number' button — re-runs the same range/label
-    the user just used, so they never have to re-navigate the service/country
-    menus just to grab a fresh number."""
-    query = update.callback_query
-    await query.answer()
-    chat_id = query.message.chat_id
-    KNOWN_USERS.add(chat_id)
-    token = query.data.split(":", 1)[1]
-    cached = REPEAT_CACHE.get(token)
-    if not cached:
-        await query.edit_message_text("⚠️ This shortcut expired — please start again from the menu.")
-        return
-    rng, label = cached
-    await start_getnum_flow(chat_id, rng, context, edit_query=query, label=label)
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    USER_STATE.pop(chat_id, None)
+    cleared = False
+
+    if USER_STATE.pop(chat_id, None) is not None:
+        cleared = True
+
     task = ACTIVE_TASKS.get(chat_id)
     if task and not task.done():
         task.cancel()
-        message_id = ACTIVE_MSG.pop(chat_id, None)
-        if message_id:
-            try:
-                await context.bot.edit_message_text(
-                    chat_id=chat_id, message_id=message_id, text="🛑 Stopped waiting for the code."
-                )
-            except Exception:
-                pass
-        await update.message.reply_text("🛑 Stopped waiting.")
+        cleared = True
+
+    if cleared:
+        await update.message.reply_text("🛑 Stopped / cancelled.")
     else:
         await update.message.reply_text("Nothing in progress.")
 
@@ -551,12 +635,34 @@ async def codes_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines))
 
 
+async def live_feed_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    KNOWN_USERS.add(update.effective_chat.id)
+
+    if not services:
+        text = "No verified ranges saved yet."
+    else:
+        lines = []
+        for name, countries in services.items():
+            if not countries:
+                continue
+            lines.append(f"*{name}*")
+            for country, rng in countries.items():
+                flag = flag_emoji(country.split(" (")[0])
+                lines.append(f"  • {country} {flag} — `{rng}`".rstrip())
+        text = "📡 *Known working ranges:*\n\n" + "\n".join(lines) if lines else "No verified ranges saved yet."
+
+    text += "\n\n🔴 Live incoming codes (masked) are posted in real time in our group."
+    buttons = InlineKeyboardMarkup([[InlineKeyboardButton("Open Group", url=GROUP_LINK)]]) if GROUP_LINK else None
+    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=buttons)
+
+
 HELP_TEXT = (
     "ℹ️ *How it works*\n\n"
-    "📱 *Get Number* — pick a service, then a country; the bot allocates a "
-    "number and waits for its code automatically\n"
+    "📱 *Get Number* — pick a service, then a country (or a custom range); the "
+    "bot allocates a number and waits for its code automatically\n"
     "📡 *Browse Ranges* — see raw ranges by sender id (advanced/manual)\n"
-    "📨 *My Codes* — your last received codes\n\n"
+    "📨 *My Codes* — your last received codes\n"
+    "🔴 *Live Feed* — known working ranges, plus a link to the live group feed\n\n"
     "You can also type `/getnum 22501XXX` directly."
 )
 
@@ -629,6 +735,56 @@ def _range_already_known(rng):
     return False
 
 
+async def auto_poll_getupdate_feed(context: ContextTypes.DEFAULT_TYPE):
+    """Background job: mirrors every genuinely new incoming SMS into the live-feed
+    group, with the OTP code masked out so it can't be grabbed by someone else —
+    only service/country/sender/range info is shown. Only ever shows a Range
+    that's a real, already-verified entry from our services list, so anyone
+    copying it into Custom Range gets a working range."""
+    try:
+        data = await api_call("GET", "/publicapi/getupdate")
+    except Exception as e:
+        logger.info("auto_poll_getupdate_feed: getupdate call failed (%s) — will retry next cycle.", e)
+        return
+
+    rows = data.get("rows", []) if data else []
+    if not rows:
+        return
+
+    first_run = not SEEN_FEED_KEYS
+    # Process oldest-first so the group feed reads in chronological order.
+    for r in reversed(rows):
+        key = (r["number"], r["message"], r["at_ms"])
+        if key in SEEN_FEED_KEYS:
+            continue
+        SEEN_FEED_KEYS.add(key)
+
+        if first_run:
+            continue  # don't dump the whole existing backlog into the group on startup
+
+        code = extract_code(r["message"])
+        masked = mask_code_in_message(r["message"], code)
+        service = detect_service(r["message"]) or "Unknown"
+        country = r.get("country") or "Unknown"
+        flag = flag_emoji(country)
+        known_range = find_known_range_for_country(country)
+
+        lines = [
+            "🆕 *New Activity*",
+            f"⚙️ Service: {service}",
+            f"🌍 Country: {country} {flag}".strip(),
+        ]
+        if known_range:
+            lines.append(f"📱 Range: `{known_range}`")
+        lines.append(f"✉️ Full SMS:\n{masked}")
+
+        await post_to_group(context, "\n".join(lines))
+
+    # Keep the seen-set from growing forever across a long-running process.
+    if len(SEEN_FEED_KEYS) > 5000:
+        SEEN_FEED_KEYS.clear()
+
+
 async def auto_poll_liveaccess(context: ContextTypes.DEFAULT_TYPE):
     """Background job: checks Zebra's liveaccess endpoint every few minutes and
     self-adds any new range it finds under AUTO_SERVICE_NAME. Silently does
@@ -663,12 +819,13 @@ async def auto_poll_liveaccess(context: ContextTypes.DEFAULT_TYPE):
     if newly_added:
         save_services()
         text = "🔎 *Auto-detected new range(s):*\n\n" + "\n".join(f"• {line}" for line in newly_added)
-        text += f"\n\nSaved under *{AUTO_SERVICE_NAME}* — move them into a named service anytime from the admin panel."
+        admin_text = text + f"\n\nSaved under *{AUTO_SERVICE_NAME}* — move them into a named service anytime from the admin panel."
         for admin_id in ADMIN_IDS:
             try:
-                await context.bot.send_message(admin_id, text, parse_mode=ParseMode.MARKDOWN)
+                await context.bot.send_message(admin_id, admin_text, parse_mode=ParseMode.MARKDOWN)
             except Exception:
                 pass
+        await post_to_group(context, text)
 
 
 def services_menu_kb():
@@ -860,6 +1017,13 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if await admin_text_handler(update, context):
         return
 
+    # Regular-user "custom range" entry takes priority over button labels too
+    if USER_STATE.get(chat_id) == "awaiting_custom_range":
+        USER_STATE.pop(chat_id, None)
+        rng = update.message.text.strip()
+        await start_getnum_flow(chat_id, rng, context)
+        return
+
     text = update.message.text.strip()
 
     if text == "📱 Get Number":
@@ -868,6 +1032,8 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_sender_list(update)
     elif text == "📨 My Codes":
         await codes_command(update, context)
+    elif text == "🔴 Live Feed":
+        await live_feed_command(update, context)
     elif text == "ℹ️ Help":
         await update.message.reply_text(HELP_TEXT, parse_mode=ParseMode.MARKDOWN)
     elif text == "🛠 Admin":
@@ -914,7 +1080,7 @@ def main():
     app.add_handler(CommandHandler("admin", admin_command))
 
     app.add_handler(CallbackQueryHandler(admin_callback_router, pattern=r"^adm:"))
-    app.add_handler(CallbackQueryHandler(service_callback_router, pattern=r"^svc"))
+    app.add_handler(CallbackQueryHandler(service_callback_router, pattern=r"^(svc|customrange)"))
     app.add_handler(CallbackQueryHandler(raw_callback_router, pattern=r"^(sender:|getnum:)"))
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
@@ -922,6 +1088,7 @@ def main():
 
     if app.job_queue is not None:
         app.job_queue.run_repeating(auto_poll_liveaccess, interval=AUTO_POLL_SECONDS, first=15)
+        app.job_queue.run_repeating(auto_poll_getupdate_feed, interval=FEED_POLL_SECONDS, first=10)
     else:
         print("⚠️  JobQueue not available — install with 'pip install \"python-telegram-bot[job-queue]\"' for auto-detection.")
 
