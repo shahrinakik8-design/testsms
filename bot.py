@@ -59,7 +59,7 @@ DATA_DIR = os.environ.get("DATA_DIR", os.path.dirname(os.path.abspath(__file__))
 SERVICES_FILE = os.path.join(DATA_DIR, "services.json")
 CONFIG_FILE = os.path.join(DATA_DIR, "config.json")
 
-CONFIG = {"max_per_user": 3}
+CONFIG = {"max_per_user": 1, "range_hits": {}}
 
 
 def load_config():
@@ -244,47 +244,15 @@ def detect_service(message):
     return None
 
 
-def country_ranges(service, country):
-    value = services.get(service, {}).get(country, [])
-    if isinstance(value, list):
-        return list(dict.fromkeys(str(x).strip() for x in value if str(x).strip()))
-    return [str(value).strip()] if value else []
-
-
 def find_known_range_for_country(country):
+    """Only returns a range if we've genuinely saved one for this country before
+    (via admin manual entry or auto-detection) — never fabricated, so it's always
+    safe to copy into Custom Range."""
     for countries in services.values():
-        for name, value in countries.items():
-            if name.split(" (")[0] == country:
-                ranges = value if isinstance(value, list) else [value]
-                return ranges[0] if ranges else None
+        for name, rng in countries.items():
+            if name.split(" (")[0] == country:  # strip any "(2)" dedup suffix
+                return rng
     return None
-
-
-def _all_known_ranges():
-    out = set()
-    for countries in services.values():
-        for value in countries.values():
-            out.update(value if isinstance(value, list) else [value])
-    return {str(x) for x in out if x}
-
-
-def _range_sort_key(rng):
-    digits = "".join(ch for ch in str(rng) if ch.isdigit())
-    return int(digits) if digits else -1
-
-
-def _country_sort_key(item):
-    country, ranges = item
-    return (max((_range_sort_key(r) for r in ranges), default=-1), country.lower())
-
-
-def _add_range(service, country, rng):
-    bucket = services.setdefault(service, {}).setdefault(country, [])
-    if rng in bucket or _range_already_known(rng):
-        return False
-    bucket.append(rng)
-    bucket.sort(key=_range_sort_key, reverse=True)
-    return True
 
 
 def mask_code_in_message(message, code):
@@ -294,31 +262,15 @@ def mask_code_in_message(message, code):
 
 
 def load_services():
-    """Load services and migrate old country->single-range data to country->ranges."""
     global services
-    if not os.path.exists(SERVICES_FILE):
+    if os.path.exists(SERVICES_FILE):
+        try:
+            with open(SERVICES_FILE, "r", encoding="utf-8") as f:
+                services = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            services = {}
+    else:
         services = {}
-        return
-    try:
-        with open(SERVICES_FILE, "r", encoding="utf-8") as f:
-            raw = json.load(f)
-    except (json.JSONDecodeError, OSError):
-        services = {}
-        return
-    migrated = {}
-    for service, countries in (raw or {}).items():
-        if not isinstance(countries, dict):
-            continue
-        migrated[service] = {}
-        for country, value in countries.items():
-            if isinstance(value, list):
-                ranges = [str(x).strip() for x in value if str(x).strip()]
-            elif value:
-                ranges = [str(value).strip()]
-            else:
-                ranges = []
-            migrated[service][country] = list(dict.fromkeys(ranges))
-    services = migrated
 
 
 def save_services():
@@ -413,42 +365,50 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ── Get Number by service + country ─────────────────────────────────────
 
 async def show_services(update_or_query, edit=False, user_id=None):
+    custom_btn = [InlineKeyboardButton("✍️ Custom Range", callback_data="customrange")]
     visible_services = {
-        name: c for name, c in services.items()
-        if name != AUTO_SERVICE_NAME or is_admin(user_id)
+        name: c for name, c in services.items() if name != AUTO_SERVICE_NAME or is_admin(user_id)
     }
-    buttons = [[InlineKeyboardButton(name, callback_data=f"svc:{name}")]
-               for name in sorted(visible_services)]
-    buttons.append([InlineKeyboardButton("✍️ Custom Range", callback_data="customrange")])
-    buttons.append([InlineKeyboardButton("⬅️ Back", callback_data="user:home")])
-    text = "📱 *Choose a service:*" if visible_services else (
-        "No services configured yet. Enter a custom range yourself, or ask an admin to add a service."
-    )
-    kb = InlineKeyboardMarkup(buttons)
+
+    if not visible_services:
+        text = "No services configured yet. Enter a custom range yourself, or ask an admin to add a service."
+        kb = InlineKeyboardMarkup([custom_btn])
+        if edit:
+            await update_or_query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
+        else:
+            await update_or_query.message.reply_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
+        return
+
+    buttons = [[InlineKeyboardButton(name, callback_data=f"svc:{name}")] for name in visible_services.keys()]
+    buttons.append(custom_btn)
+    text = "📱 *Choose a service:*"
     if edit:
-        await update_or_query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
+        await update_or_query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup(buttons))
     else:
-        await update_or_query.message.reply_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
+        await update_or_query.message.reply_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup(buttons))
 
 
 async def show_countries(query, service):
-    if service not in services:
-        await query.edit_message_text("That service no longer exists.", reply_markup=back_inline("svcback"))
+    countries = services.get(service, {})
+    back_btn = InlineKeyboardButton("⬅️ Back", callback_data="svcback")
+    if not countries:
+        await query.edit_message_text(
+            f"No countries configured for {service} yet.", reply_markup=InlineKeyboardMarkup([[back_btn]])
+        )
         return
-    items = [(country, country_ranges(service, country))
-             for country in services.get(service, {})
-             if country_ranges(service, country)]
-    items.sort(key=_country_sort_key, reverse=True)
-    buttons = []
-    for country, ranges in items:
-        flag = flag_emoji(country.split(" (")[0])
-        label = f"{flag} {country}".strip()
-        if len(ranges) > 1:
-            label += f"  ×{len(ranges)}"
-        buttons.append([InlineKeyboardButton(label, callback_data=f"svccountry:{service}:{country}")])
-    buttons.append([InlineKeyboardButton("⬅️ Back", callback_data="svcback")])
-    text = f"🌍 *{service}* — choose a country:" if items else f"No countries configured for {service} yet."
-    await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup(buttons))
+
+    hits = CONFIG.get("range_hits", {})
+    ordered = sorted(countries.items(), key=lambda kv: hits.get(kv[1], 0), reverse=True)
+    buttons = [
+        [InlineKeyboardButton(country, callback_data=f"svccountry:{service}:{country}")]
+        for country, _rng in ordered
+    ]
+    buttons.append([back_btn])
+    await query.edit_message_text(
+        f"🌍 *{service}* — choose a country:",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
 
 
 async def service_callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -462,58 +422,23 @@ async def service_callback_router(update: Update, context: ContextTypes.DEFAULT_
         USER_STATE[chat_id] = "awaiting_custom_range"
         await query.edit_message_text(
             "✍️ Send the range you want a number from, e.g. `22501XXX`.\nSend /cancel to abort.",
-            parse_mode=ParseMode.MARKDOWN, reply_markup=back_inline("user:home"),
+            parse_mode=ParseMode.MARKDOWN,
         )
-    elif data == "user:home":
-        await query.edit_message_text(WELCOME, parse_mode=ParseMode.MARKDOWN, reply_markup=back_inline("user:home"))
+
     elif data == "svcback":
         await show_services(query, edit=True, user_id=query.from_user.id)
-    elif data.startswith("chgnum:"):
-        rng = data.split(":", 1)[1]
-        info = None
-        old_number = None
-        for number, candidate in ACTIVE_NUMBERS.get(chat_id, {}).items():
-            if candidate.get("message_id") == query.message.message_id:
-                old_number, info = number, candidate
-                break
-        if info:
-            ACTIVE_NUMBERS[chat_id].pop(old_number, None)
-            if not info["task"].done():
-                info["task"].cancel()
-        await start_getnum_flow(
-            chat_id, rng, context, edit_query=query,
-            label=(f"{info.get('service')} / {info.get('country')}" if info and info.get("service") else None),
-            service=info.get("service") if info else None,
-            country=info.get("country") if info else None,
-        )
-    elif data.startswith("chgcountry:"):
-        await show_countries(query, data.split(":", 1)[1])
-    elif data.startswith("backnum:"):
-        service = data.split(":", 1)[1]
-        if service != "none":
-            await show_countries(query, service)
-        else:
-            await show_sender_list(query, edit=True)
+
     elif data.startswith("svc:"):
-        await show_countries(query, data.split(":", 1)[1])
+        service = data.split(":", 1)[1]
+        await show_countries(query, service)
+
     elif data.startswith("svccountry:"):
         _, service, country = data.split(":", 2)
-        ranges = country_ranges(service, country)
-        if not ranges:
-            await query.edit_message_text("That option no longer exists.", reply_markup=back_inline("svcback"))
+        rng = services.get(service, {}).get(country)
+        if not rng:
+            await query.edit_message_text("That option no longer exists.", reply_markup=back_inline())
             return
-        active_count = sum(1 for info in ACTIVE_NUMBERS.get(chat_id, {}).values() if not info["task"].done())
-        limit = int(CONFIG.get("max_per_user", 3))
-        if active_count + len(ranges) > limit:
-            await query.edit_message_text(
-                f"⚠️ {len(ranges)} number(s) are configured for this country, but your active limit is {limit}.",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data=f"svc:{service}")]]),
-            )
-            return
-        await start_getnum_flow(
-            chat_id, ranges, context, edit_query=query,
-            label=f"{service} / {country}", service=service, country=country,
-        )
+        await start_getnum_flow(chat_id, rng, context, edit_query=query, label=f"{service} / {country}")
 
 
 # ── Raw range browsing (unchanged from before, kept as a fallback) ──────
@@ -523,21 +448,19 @@ async def show_sender_list(update_or_query, edit=False):
         data = await api_call("GET", "/publicapi/liveaccess")
     except Exception as e:
         text = f"⚠️ Error: {e}"
-        kb = back_inline("user:home")
         if edit:
-            await update_or_query.edit_message_text(text, reply_markup=kb)
+            await update_or_query.edit_message_text(text)
         else:
-            await update_or_query.message.reply_text(text, reply_markup=kb)
+            await update_or_query.message.reply_text(text)
         return
 
     rows = data.get("rows", [])
     if not rows:
         text = "No senders delivering right now."
-        kb = back_inline("user:home")
         if edit:
-            await update_or_query.edit_message_text(text, reply_markup=kb)
+            await update_or_query.edit_message_text(text)
         else:
-            await update_or_query.message.reply_text(text, reply_markup=kb)
+            await update_or_query.message.reply_text(text)
         return
 
     buttons = [[InlineKeyboardButton(f"{r['sender']} ({len(r['ranges'])})", callback_data=f"sender:{r['sender']}")]
@@ -551,18 +474,19 @@ async def show_sender_list(update_or_query, edit=False):
 
 
 async def show_ranges_for_sender(query, sender):
+    back_btn = InlineKeyboardButton("⬅️ Back", callback_data="backtosenders")
     try:
         data = await api_call("GET", "/publicapi/liveaccess", params={"sender": sender})
     except Exception as e:
-        await query.edit_message_text(f"⚠️ Error: {e}", reply_markup=back_inline())
+        await query.edit_message_text(f"⚠️ Error: {e}", reply_markup=InlineKeyboardMarkup([[back_btn]]))
         return
     rows = data.get("rows", [])
     ranges = rows[0]["ranges"] if rows else []
     if not ranges:
-        await query.edit_message_text(f"No ranges found for {sender}.", reply_markup=back_inline())
+        await query.edit_message_text(f"No ranges found for {sender}.", reply_markup=InlineKeyboardMarkup([[back_btn]]))
         return
     buttons = [[InlineKeyboardButton(rng, callback_data=f"getnum:{rng}")] for rng in ranges]
-    buttons.append([InlineKeyboardButton("⬅️ Back", callback_data="rawback")])
+    buttons.append([back_btn])
     await query.edit_message_text(
         f"📡 *{sender}* — tap a range to allocate a number:",
         parse_mode=ParseMode.MARKDOWN,
@@ -577,13 +501,29 @@ async def raw_callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE
     chat_id = query.message.chat_id
     KNOWN_USERS.add(chat_id)
 
-    if data == "rawback":
-        await show_sender_list(query, edit=True)
-    elif data.startswith("sender:"):
+    if data.startswith("sender:"):
         await show_ranges_for_sender(query, data.split(":", 1)[1])
+
+    elif data == "backtosenders":
+        await show_sender_list(query, edit=True)
+
     elif data.startswith("getnum:"):
-        rng = data.split(":", 1)[1]
-        await start_getnum_flow(chat_id, rng, context, edit_query=query)
+        payload = data.split(":", 1)[1]
+        if "|" in payload:
+            rng, label = payload.split("|", 1)
+        else:
+            rng, label = payload, None
+        await start_getnum_flow(chat_id, rng, context, edit_query=query, label=label)
+
+    elif data.startswith("delnum:"):
+        number = data.split(":", 1)[1]
+        info = ACTIVE_NUMBERS.get(chat_id, {}).pop(number, None)
+        if info and not info["task"].done():
+            info["task"].cancel()
+        try:
+            await query.edit_message_text(f"🗑 Deleted `{number}`.", parse_mode=ParseMode.MARKDOWN)
+        except Exception:
+            pass
 
 
 # ── Get number + wait for code (core logic, reused everywhere) ─────────
@@ -597,84 +537,81 @@ async def getnum_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await start_getnum_flow(chat_id, context.args[0], context)
 
 
-def number_action_kb(rng, service=None, country=None):
-    rows = [[InlineKeyboardButton("🔄 Change Number", callback_data=f"chgnum:{rng}")]]
-    if service:
-        rows.append([InlineKeyboardButton("🌍 Change Country", callback_data=f"chgcountry:{service}")])
-    rows.append([InlineKeyboardButton("⬅️ Back", callback_data=f"backnum:{service or 'none'}")])
+def number_card_kb(rng, number, service=None, label=None):
+    change_data = f"getnum:{rng}|{label}" if label else f"getnum:{rng}"
+    rows = [[
+        InlineKeyboardButton("🔄 Change Number", callback_data=change_data),
+        InlineKeyboardButton("🗑 Delete Number", callback_data=f"delnum:{number}"),
+    ]]
+    if service and service in services:
+        rows.append([InlineKeyboardButton("🌍 Change Country", callback_data=f"svc:{service}")])
+    if GROUP_LINK:
+        rows.append([InlineKeyboardButton("🔍 OTP GRUP 🔍", url=GROUP_LINK)])
     return InlineKeyboardMarkup(rows)
 
 
-async def start_getnum_flow(chat_id, rngs, context, edit_query=None, label=None, service=None, country=None):
+async def start_getnum_flow(chat_id, rng, context, edit_query=None, label=None):
     global NUMBERS_ALLOCATED
-    if isinstance(rngs, str):
-        rngs = [rngs]
-    rngs = list(dict.fromkeys(str(r).strip() for r in rngs if str(r).strip()))
-    if not rngs:
-        msg = "⚠️ No range configured."
-        if edit_query:
-            await edit_query.edit_message_text(msg, reply_markup=back_inline("svcback"))
-        else:
-            await context.bot.send_message(chat_id, msg)
-        return
+
     active = ACTIVE_NUMBERS.setdefault(chat_id, {})
-    ACTIVE_NUMBERS[chat_id] = {num: info for num, info in active.items() if not info["task"].done()}
-    limit = int(CONFIG.get("max_per_user", 3))
-    if len(ACTIVE_NUMBERS[chat_id]) + len(rngs) > limit:
-        msg = f"⏳ You need {len(rngs)} slots, but your active-number limit is {limit}."
+    active = {num: info for num, info in active.items() if not info["task"].done()}
+    ACTIVE_NUMBERS[chat_id] = active
+
+    limit = CONFIG.get("max_per_user", 1)
+    if len(active) >= limit:
+        msg = f"⏳ You already have {limit} active number(s) — cancel one with /cancel first, or wait for it to finish."
         if edit_query:
-            await edit_query.edit_message_text(msg, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(
-                "⬅️ Back", callback_data=f"svc:{service}" if service else "rawback"
-            )]]))
+            await edit_query.edit_message_text(msg)
         else:
             await context.bot.send_message(chat_id, msg)
         return
 
-    first = True
-    for rng in rngs:
-        try:
-            data = await api_call("POST", "/publicapi/getnum", json={"range": rng})
-        except Exception as e:
-            msg = f"⚠️ Error for `{rng}`: {e}"
-            if edit_query and first:
-                await edit_query.edit_message_text(msg, parse_mode=ParseMode.MARKDOWN, reply_markup=back_inline("svcback"))
-            else:
-                await context.bot.send_message(chat_id, msg, parse_mode=ParseMode.MARKDOWN)
-            first = False
-            continue
-        if not data or not data.get("rows"):
-            msg = f"⚠️ No number returned for range `{rng}`."
-            if edit_query and first:
-                await edit_query.edit_message_text(msg, parse_mode=ParseMode.MARKDOWN, reply_markup=back_inline("svcback"))
-            else:
-                await context.bot.send_message(chat_id, msg, parse_mode=ParseMode.MARKDOWN)
-            first = False
-            continue
-        row = data["rows"][0]
-        number = row["number"]
-        expires_ms = row["expires_ms"]
-        expires_str = time.strftime("%H:%M:%S", time.localtime(expires_ms / 1000))
-        NUMBERS_ALLOCATED += 1
-        header = f"🏷 *{label}*\n" if label else ""
-        text = (
-            f"{header}✨ *NUMBER ALLOCATED* ✨\n\n"
-            f"📞 ```\n{number}\n```\n"
-            f"🌍 {row.get('country', country or 'Unknown')} • {row.get('operator', 'Unknown')}\n"
-            f"📌 Range: `{rng}`\n"
-            f"⏰ Expires at {expires_str}\n\n⌛ Waiting for the code..."
-        )
-        markup = number_action_kb(rng, service, country)
-        if edit_query and first:
-            sent = await edit_query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=markup)
+    try:
+        data = await api_call("POST", "/publicapi/getnum", json={"range": rng})
+    except Exception as e:
+        msg = f"⚠️ Error: {e}"
+        if edit_query:
+            await edit_query.edit_message_text(msg)
         else:
-            sent = await context.bot.send_message(chat_id, text, parse_mode=ParseMode.MARKDOWN, reply_markup=markup)
-        message_id = getattr(sent, "message_id", None)
-        task = asyncio.create_task(_wait_for_code(chat_id, number, rng, expires_ms, context, label, service, country))
-        ACTIVE_NUMBERS[chat_id][number] = {
-            "task": task, "message_id": message_id, "rng": rng,
-            "service": service, "country": country,
-        }
-        first = False
+            await context.bot.send_message(chat_id, msg)
+        return
+
+    if not data or not data.get("rows"):
+        msg = "⚠️ No number returned for that range."
+        if edit_query:
+            await edit_query.edit_message_text(msg)
+        else:
+            await context.bot.send_message(chat_id, msg)
+        return
+
+    row = data["rows"][0]
+    number = row["number"]
+    expires_ms = row["expires_ms"]
+    expires_str = time.strftime("%H:%M:%S", time.localtime(expires_ms / 1000))
+    NUMBERS_ALLOCATED += 1
+
+    service = label.split(" / ")[0] if label else None
+    flag = flag_emoji(row.get("country", ""))
+
+    header = f"*{label}*\n" if label else ""
+    text = (
+        f"📱 *Number Assigned*\n\n"
+        f"{header}"
+        f"{flag} `{number}`\n"
+        f"🌍 {row['country']} • {row['operator']}\n"
+        f"⏰ Expires at {expires_str}\n\n"
+        f"⌛ Waiting for the code... (/cancel to stop)"
+    )
+    kb = number_card_kb(rng, number, service, label)
+    if edit_query:
+        sent = await edit_query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
+    else:
+        sent = await context.bot.send_message(chat_id, text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
+
+    message_id = getattr(sent, "message_id", None)
+
+    task = asyncio.create_task(_wait_for_code(chat_id, number, rng, expires_ms, context, label))
+    ACTIVE_NUMBERS[chat_id][number] = {"task": task, "message_id": message_id, "rng": rng}
 
 
 async def _update_status(chat_id, number, context, text, reply_markup=None):
@@ -703,13 +640,16 @@ async def _vanish_later(context, chat_id, message_id, delay=60):
         pass
 
 
-async def _wait_for_code(chat_id, number, rng, expires_ms, context, label=None, service=None, country=None):
+async def _wait_for_code(chat_id, number, rng, expires_ms, context, label=None):
     try:
         seen_data = await api_call("GET", "/publicapi/getupdate")
         seen = {(r["number"], r["message"], r["at_ms"]) for r in seen_data.get("rows", [])}
     except Exception:
         seen = set()
-    again_kb = number_action_kb(rng, service, country)
+
+    service = label.split(" / ")[0] if label else None
+    again_kb = number_card_kb(rng, number, service, label)
+
     try:
         while True:
             if int(time.time() * 1000) > expires_ms:
@@ -718,21 +658,24 @@ async def _wait_for_code(chat_id, number, rng, expires_ms, context, label=None, 
             try:
                 data = await api_call("GET", "/publicapi/getupdate")
             except Exception as e:
-                await _update_status(chat_id, number, context, f"⚠️ Error polling for code: {e}", reply_markup=again_kb)
+                await _update_status(chat_id, number, context, f"⚠️ Error polling for code: {e}")
                 return
+
             for r in data.get("rows", []):
                 key = (r["number"], r["message"], r["at_ms"])
                 if r["number"] == number and key not in seen:
                     code = extract_code(r["message"])
-                    header = f"🏷 *{label}*\n" if label else ""
-                    text = f"{header}🎉 *SMS RECEIVED* 🎉\n\n📞 `{number}`\n💬 {r['message']}"
+                    header = f"*{label}*\n" if label else ""
+                    text = f"🎉 *SMS Received*\n\n{header}📞 `{number}`\n💬 {r['message']}"
                     if code:
                         text += f"\n\n🔑 *CODE*\n```\n{code}\n```"
                     msg_id = await _update_status(chat_id, number, context, text, reply_markup=again_kb)
+
                     group_text = f"📨 *{r['sender']}* — `{number}`\n{r['message']}"
                     if code:
                         group_text += f"\n*Code:* `{code}`"
                     await post_to_group(context, group_text)
+
                     if msg_id is not None:
                         asyncio.create_task(_vanish_later(context, chat_id, msg_id, delay=60))
                     return
@@ -789,14 +732,9 @@ async def live_feed_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not countries:
                 continue
             lines.append(f"*{name}*")
-            for country, value in sorted(
-                countries.items(),
-                key=lambda item: _country_sort_key((item[0], country_ranges(name, item[0]))),
-                reverse=True,
-            ):
+            for country, rng in countries.items():
                 flag = flag_emoji(country.split(" (")[0])
-                for rng in sorted(country_ranges(name, country), key=_range_sort_key, reverse=True):
-                    lines.append(f"  • {country} {flag} — `{rng}`".rstrip())
+                lines.append(f"  • {country} {flag} — `{rng}`".rstrip())
         text = "📡 *Known working ranges:*\n\n" + "\n".join(lines) if lines else "No verified ranges saved yet."
 
     text += "\n\n🔴 Live incoming codes (masked) are posted in real time in our group."
@@ -877,7 +815,11 @@ async def show_admin_ranges_for_sender(query, service, sender):
 
 
 def _range_already_known(rng):
-    return rng in _all_known_ranges()
+    """True if this exact range is already saved under any service."""
+    for countries in services.values():
+        if rng in countries.values():
+            return True
+    return False
 
 
 async def auto_poll_getupdate_feed(context: ContextTypes.DEFAULT_TYPE):
@@ -947,14 +889,23 @@ async def auto_poll_liveaccess(context: ContextTypes.DEFAULT_TYPE):
 
     newly_added = []
     services.setdefault(AUTO_SERVICE_NAME, {})
+    hits = CONFIG.setdefault("range_hits", {})
+
     for row in rows:
         for rng in row.get("ranges", []):
+            hits[rng] = hits.get(rng, 0) + 1  # track how often this range shows up live
             if _range_already_known(rng):
-                continue
+                continue  # already saved somewhere (auto or manual) — don't duplicate
             country = guess_country_from_range(rng) or rng
-            if _add_range(AUTO_SERVICE_NAME, country, rng):
-                newly_added.append(f"{country} → {rng}")
+            base_country = country
+            n = 2
+            while country in services[AUTO_SERVICE_NAME]:
+                country = f"{base_country} ({n})"
+                n += 1
+            services[AUTO_SERVICE_NAME][country] = rng
+            newly_added.append(f"{country} → {rng}")
 
+    save_config()
     if newly_added:
         save_services()
         text = "🔎 *Auto-detected new range(s):*\n\n" + "\n".join(f"• {line}" for line in newly_added)
@@ -967,7 +918,7 @@ def services_menu_kb():
         [InlineKeyboardButton("🌍 Add Country to Service", callback_data="adm:svc_addcountry")],
         [InlineKeyboardButton("📋 List Services", callback_data="adm:svc_list")],
         [InlineKeyboardButton("🗑 Remove Service", callback_data="adm:svc_remove")],
-        [InlineKeyboardButton("🗑 Remove Country", callback_data="adm:country_remove")],
+        [InlineKeyboardButton("🗑 Remove Country", callback_data="adm:svc_remcountry")],
         [InlineKeyboardButton("⬅️ Back", callback_data="adm:home")],
     ])
 
@@ -1055,81 +1006,36 @@ async def admin_callback_router(update: Update, context: ContextTypes.DEFAULT_TY
         if service not in services:
             await query.edit_message_text("That service no longer exists.", reply_markup=services_menu_kb())
             return
-        country = guess_country_from_range(rng) or rng
-        if _range_already_known(rng):
-            await query.edit_message_text(
-                f"↔️ `{rng}` is already assigned. Duplicate not added.",
-                parse_mode=ParseMode.MARKDOWN, reply_markup=services_menu_kb()
-            )
-            return
-        _add_range(service, country, rng)
+        country = guess_country_from_range(rng) or rng  # fall back to the range itself if unknown
+        # avoid silently overwriting a different range already saved under the same country name
+        suffix = ""
+        base_country = country
+        n = 2
+        while country in services[service] and services[service][country] != rng:
+            country = f"{base_country} ({n})"
+            n += 1
+        services[service][country] = rng
         save_services()
         await query.edit_message_text(
-            f"✅ Added *{country}* → `{rng}` under *{service}*.",
-            parse_mode=ParseMode.MARKDOWN, reply_markup=services_menu_kb()
+            f"✅ Auto-added *{country}* → `{rng}` under *{service}*.",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=services_menu_kb(),
         )
-
-
-    elif data == "adm:country_remove":
-        if not services:
-            await query.edit_message_text("No services configured yet.", reply_markup=services_menu_kb())
-            return
-        buttons = [[InlineKeyboardButton(name, callback_data=f"adm:country_service:{name}")] for name in sorted(services)]
-        buttons.append([InlineKeyboardButton("⬅️ Back", callback_data="adm:services")])
-        await query.edit_message_text("Pick the service whose country you want to remove:", reply_markup=InlineKeyboardMarkup(buttons))
-
-    elif data.startswith("adm:country_service:"):
-        service = data.split(":", 2)[2]
-        countries = services.get(service, {})
-        buttons = [[InlineKeyboardButton(
-            f"🗑 {flag_emoji(country.split(' (')[0])} {country}".strip(),
-            callback_data=f"adm:countrydel:{service}:{country}"
-        )] for country in sorted(
-            countries,
-            key=lambda c: _country_sort_key((c, country_ranges(service, c))),
-            reverse=True,
-        )]
-        buttons.append([InlineKeyboardButton("⬅️ Back", callback_data="adm:country_remove")])
-        await query.edit_message_text(
-            f"Pick a country to remove from *{service}*:",
-            parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup(buttons)
-        )
-
-    elif data.startswith("adm:countrydel:"):
-        _, _, service, country = data.split(":", 3)
-        if service in services and country in services[service]:
-            services[service].pop(country, None)
-            save_services()
-            await query.edit_message_text(
-                f"🗑 Removed country *{country}* from *{service}*.",
-                parse_mode=ParseMode.MARKDOWN, reply_markup=services_menu_kb()
-            )
-        else:
-            await query.edit_message_text("That country no longer exists.", reply_markup=services_menu_kb())
 
     elif data == "adm:svc_list":
         if not services:
             text = "No services configured yet."
         else:
             lines = []
-            for name in sorted(services):
+            for name, countries in services.items():
                 lines.append(f"*{name}*")
-                countries = services[name]
-                if not countries:
+                if countries:
+                    for country, rng in countries.items():
+                        lines.append(f"  • {country} — `{rng}`")
+                else:
                     lines.append("  _(no countries yet)_")
-                    continue
-                for country, value in sorted(
-                    countries.items(),
-                    key=lambda item: _country_sort_key((item[0], country_ranges(name, item[0]))),
-                    reverse=True,
-                ):
-                    ranges = country_ranges(name, country)
-                    lines.append(f"  • {country} — {len(ranges)} range(s)")
-                    for rng in sorted(ranges, key=_range_sort_key, reverse=True):
-                        lines.append(f"      `{rng}`")
             text = "📋 *Services*\n\n" + "\n".join(lines)
         await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=services_menu_kb())
-
 
     elif data == "adm:svc_remove":
         if not services:
@@ -1144,6 +1050,35 @@ async def admin_callback_router(update: Update, context: ContextTypes.DEFAULT_TY
         services.pop(service, None)
         save_services()
         await query.edit_message_text(f"🗑 Removed *{service}*.", parse_mode=ParseMode.MARKDOWN, reply_markup=services_menu_kb())
+
+    elif data == "adm:svc_remcountry":
+        if not services:
+            await query.edit_message_text("No services yet.", reply_markup=services_menu_kb())
+            return
+        buttons = [[InlineKeyboardButton(name, callback_data=f"adm:remcountrysvc:{name}")] for name in services.keys()]
+        buttons.append([InlineKeyboardButton("⬅️ Back", callback_data="adm:services")])
+        await query.edit_message_text("Pick the service to remove a country from:", reply_markup=InlineKeyboardMarkup(buttons))
+
+    elif data.startswith("adm:remcountrysvc:"):
+        service = data.split(":", 2)[2]
+        countries = services.get(service, {})
+        if not countries:
+            await query.edit_message_text(f"No countries under {service}.", reply_markup=services_menu_kb())
+            return
+        buttons = [
+            [InlineKeyboardButton(f"🗑 {country}", callback_data=f"adm:remcountry:{service}:{country}")]
+            for country in countries.keys()
+        ]
+        buttons.append([InlineKeyboardButton("⬅️ Back", callback_data="adm:svc_remcountry")])
+        await query.edit_message_text(f"Pick a country to remove from *{service}*:", parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup(buttons))
+
+    elif data.startswith("adm:remcountry:"):
+        _, _, service, country = data.split(":", 3)
+        services.get(service, {}).pop(country, None)
+        save_services()
+        await query.edit_message_text(
+            f"🗑 Removed *{country}* from *{service}*.", parse_mode=ParseMode.MARKDOWN, reply_markup=services_menu_kb()
+        )
 
 
 async def admin_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1192,20 +1127,11 @@ async def admin_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
             )
             return True
         country, rng = text.rsplit(" ", 1)
-        country, rng = country.strip(), rng.strip()
-        if _range_already_known(rng):
-            await update.message.reply_text(
-                f"↔️ `{rng}` is already assigned. Duplicate not added.",
-                parse_mode=ParseMode.MARKDOWN
-            )
-            return True
-        if _add_range(service, country, rng):
-            save_services()
-            await update.message.reply_text(
-                f"✅ Added {country} → `{rng}` under {service}.", parse_mode=ParseMode.MARKDOWN
-            )
-        else:
-            await update.message.reply_text("↔️ Duplicate skipped.")
+        services[service][country.strip()] = rng.strip()
+        save_services()
+        await update.message.reply_text(
+            f"✅ Added {country.strip()} → `{rng.strip()}` under {service}.", parse_mode=ParseMode.MARKDOWN
+        )
 
     return True
 
@@ -1284,11 +1210,8 @@ def main():
     app.add_handler(CommandHandler("admin", admin_command))
 
     app.add_handler(CallbackQueryHandler(admin_callback_router, pattern=r"^adm:"))
-    app.add_handler(CallbackQueryHandler(
-        service_callback_router,
-        pattern=r"^(svc|svccountry:|customrange|chgnum:|chgcountry:|backnum:|user:home$)"
-    ))
-    app.add_handler(CallbackQueryHandler(raw_callback_router, pattern=r"^(sender:|getnum:|rawback$)"))
+    app.add_handler(CallbackQueryHandler(service_callback_router, pattern=r"^(svc|customrange)"))
+    app.add_handler(CallbackQueryHandler(raw_callback_router, pattern=r"^(sender:|getnum:|delnum:|backtosenders)"))
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
     app.add_error_handler(global_error_handler)
