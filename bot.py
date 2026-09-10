@@ -79,7 +79,7 @@ def save_config():
     except OSError as e:
         print(f"Could not save config.json: {e}")
 
-ACTIVE_NUMBERS = {}        # chat_id -> {number: {"task": Task, "message_id": int, "rng": str}}
+ACTIVE_BATCH = {}          # chat_id -> {"message_id":int, "rng":str, "label":str|None, "numbers": {number: {...}}}
 KNOWN_USERS = set()        # chat_ids that have started the bot (in-memory only)
 NUMBERS_ALLOCATED = 0
 ADMIN_STATE = {}           # admin chat_id -> ("action_name", extra_data)
@@ -526,11 +526,10 @@ async def raw_callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE
             rng, label = payload, None
         await start_getnum_flow(chat_id, rng, context, edit_query=query, label=label)
 
-    elif data.startswith("delnum:"):
-        number = data.split(":", 1)[1]
-        ACTIVE_NUMBERS.get(chat_id, {}).pop(number, None)
+    elif data == "delbatch":
+        ACTIVE_BATCH.pop(chat_id, None)
         try:
-            await query.edit_message_text(f"🗑 Deleted `{number}`.", parse_mode=ParseMode.MARKDOWN)
+            await query.edit_message_text("🗑 Deleted.")
         except Exception:
             pass
 
@@ -546,11 +545,26 @@ async def getnum_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await start_getnum_flow(chat_id, context.args[0], context)
 
 
-def number_card_kb(rng, number, service=None, label=None):
+def render_batch_text(batch):
+    label = batch.get("label")
+    header = f"*{label}*\n\n" if label else ""
+    lines = [f"{header}📱 *Numbers Assigned*\n"]
+    for i, (number, info) in enumerate(batch["numbers"].items(), start=1):
+        if info["status"] == "waiting":
+            lines.append(f"{i}. `{number}` — ⌛ waiting")
+        elif info["status"] == "delivered":
+            code_part = f" — 🔑 `{info['code']}`" if info.get("code") else " — ✅ delivered"
+            lines.append(f"{i}. `{number}`{code_part}")
+        elif info["status"] == "expired":
+            lines.append(f"{i}. `{number}` — ⌛ expired")
+    return "\n".join(lines)
+
+
+def batch_kb(rng, label, service=None):
     change_data = f"getnum:{rng}|{label}" if label else f"getnum:{rng}"
     rows = [[
-        InlineKeyboardButton("🔄 Change Number", callback_data=change_data),
-        InlineKeyboardButton("🗑 Delete Number", callback_data=f"delnum:{number}"),
+        InlineKeyboardButton("🔄 Get New Batch (same range)", callback_data=change_data),
+        InlineKeyboardButton("🗑 Delete All", callback_data="delbatch"),
     ]]
     if service and service in services:
         rows.append([InlineKeyboardButton("🌍 Change Country", callback_data=f"svc:{service}")])
@@ -559,88 +573,73 @@ def number_card_kb(rng, number, service=None, label=None):
     return InlineKeyboardMarkup(rows)
 
 
+async def _render_batch(chat_id, context):
+    batch = ACTIVE_BATCH.get(chat_id)
+    if not batch:
+        return
+    service = batch["label"].split(" / ")[0] if batch.get("label") else None
+    text = render_batch_text(batch)
+    kb = batch_kb(batch["rng"], batch.get("label"), service)
+    try:
+        await context.bot.edit_message_text(
+            chat_id=chat_id, message_id=batch["message_id"], text=text,
+            parse_mode=ParseMode.MARKDOWN, reply_markup=kb,
+        )
+    except Exception:
+        pass
+
+
 async def start_getnum_flow(chat_id, rng, context, edit_query=None, label=None):
     global NUMBERS_ALLOCATED
 
-    active = ACTIVE_NUMBERS.setdefault(chat_id, {})
-    limit = CONFIG.get("max_per_user", 1)
-    if len(active) >= limit:
-        msg = f"⏳ You already have {limit} active number(s) — cancel one with /cancel first, or wait for it to finish."
+    existing = ACTIVE_BATCH.get(chat_id)
+    if existing and any(info["status"] == "waiting" for info in existing["numbers"].values()):
+        msg = "⏳ You already have numbers waiting — cancel with /cancel first, or wait for them to finish."
         if edit_query:
             await edit_query.edit_message_text(msg)
         else:
             await context.bot.send_message(chat_id, msg)
         return
 
-    try:
-        data = await api_call("POST", "/publicapi/getnum", json={"range": rng})
-    except Exception as e:
-        msg = f"⚠️ Error: {e}"
+    count = max(1, CONFIG.get("max_per_user", 1))
+    allocated = []
+    last_error = None
+    for _ in range(count):
+        try:
+            data = await api_call("POST", "/publicapi/getnum", json={"range": rng})
+        except Exception as e:
+            last_error = str(e)
+            break
+        if not data or not data.get("rows"):
+            last_error = "No number returned for that range."
+            break
+        allocated.append(data["rows"][0])
+
+    if not allocated:
+        msg = f"⚠️ Error: {last_error or 'could not allocate a number.'}"
         if edit_query:
             await edit_query.edit_message_text(msg)
         else:
             await context.bot.send_message(chat_id, msg)
         return
 
-    if not data or not data.get("rows"):
-        msg = "⚠️ No number returned for that range."
-        if edit_query:
-            await edit_query.edit_message_text(msg)
-        else:
-            await context.bot.send_message(chat_id, msg)
-        return
-
-    row = data["rows"][0]
-    number = row["number"]
-    expires_ms = row["expires_ms"]
-    expires_str = time.strftime("%H:%M:%S", time.localtime(expires_ms / 1000))
-    NUMBERS_ALLOCATED += 1
+    NUMBERS_ALLOCATED += len(allocated)
+    numbers = {
+        row["number"]: {"status": "waiting", "code": None, "expires_ms": row["expires_ms"]}
+        for row in allocated
+    }
+    batch = {"rng": rng, "label": label, "numbers": numbers}
 
     service = label.split(" / ")[0] if label else None
-    flag = flag_emoji(row.get("country", ""))
-
-    header = f"*{label}*\n" if label else ""
-    text = (
-        f"📱 *Number Assigned*\n\n"
-        f"{header}"
-        f"{flag} `{number}`\n"
-        f"🌍 {row['country']} • {row['operator']}\n"
-        f"⏰ Expires at {expires_str}\n\n"
-        f"⌛ Waiting for the code... (/cancel to stop)"
-    )
-    kb = number_card_kb(rng, number, service, label)
+    text = render_batch_text(batch)
+    kb = batch_kb(rng, label, service)
     if edit_query:
         sent = await edit_query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
     else:
         sent = await context.bot.send_message(chat_id, text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
 
-    message_id = getattr(sent, "message_id", None)
-
-    # No per-number polling loop anymore — a single shared background job
-    # (central_updates_poller) checks getupdate once per cycle and delivers
-    # to every active number that matches, which is what keeps the bot fast
-    # even with many numbers active at once.
-    ACTIVE_NUMBERS[chat_id][number] = {
-        "message_id": message_id, "rng": rng, "label": label,
-        "expires_ms": expires_ms, "delivered": False,
-    }
-
-
-async def _update_status(chat_id, number, context, text, reply_markup=None):
-    """Edits this number's tracked status message in place if we have one."""
-    info = ACTIVE_NUMBERS.get(chat_id, {}).get(number)
-    message_id = info["message_id"] if info else None
-    if message_id is not None:
-        try:
-            await context.bot.edit_message_text(
-                chat_id=chat_id, message_id=message_id, text=text,
-                parse_mode=ParseMode.MARKDOWN, reply_markup=reply_markup,
-            )
-            return message_id
-        except Exception:
-            pass
-    sent = await context.bot.send_message(chat_id, text, parse_mode=ParseMode.MARKDOWN, reply_markup=reply_markup)
-    return getattr(sent, "message_id", None)
+    batch["message_id"] = getattr(sent, "message_id", None)
+    ACTIVE_BATCH[chat_id] = batch
 
 
 async def _vanish_later(context, chat_id, message_id, delay=60):
@@ -659,8 +658,7 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if USER_STATE.pop(chat_id, None) is not None:
         cleared = True
 
-    if ACTIVE_NUMBERS.get(chat_id):
-        ACTIVE_NUMBERS[chat_id].clear()
+    if ACTIVE_BATCH.pop(chat_id, None) is not None:
         cleared = True
 
     if cleared:
@@ -793,11 +791,11 @@ async def central_updates_poller(context: ContextTypes.DEFAULT_TYPE):
 
     Each poll cycle:
       1. Fetches getupdate once.
-      2. Delivers the code to any active number waiting on it (updates that
-         card, posts a copy to the group, schedules the vanish-delete).
+      2. Delivers the code to any waiting number inside any active batch,
+         re-rendering that batch's single combined message.
       3. Anything not matching an active number goes to the group as a masked
          (code-hidden) live-activity post instead.
-      4. Also expires any active number whose time ran out.
+      4. Also expires any waiting number whose time ran out.
     """
     try:
         data = await api_call("GET", "/publicapi/getupdate")
@@ -808,11 +806,14 @@ async def central_updates_poller(context: ContextTypes.DEFAULT_TYPE):
     rows = data.get("rows", []) if data else []
     first_run = not SEEN_FEED_KEYS
 
-    # number -> list of chat_ids currently waiting on that exact number
+    # number -> chat_id, for every number still waiting in any active batch
     number_index = {}
-    for chat_id, nums in ACTIVE_NUMBERS.items():
-        for number in nums:
-            number_index.setdefault(number, []).append(chat_id)
+    for chat_id, batch in ACTIVE_BATCH.items():
+        for number, info in batch["numbers"].items():
+            if info["status"] == "waiting":
+                number_index[number] = chat_id
+
+    changed_chats = set()
 
     for r in reversed(rows):  # oldest-first so the feed reads chronologically
         key = (r["number"], r["message"], r["at_ms"])
@@ -822,33 +823,22 @@ async def central_updates_poller(context: ContextTypes.DEFAULT_TYPE):
         if first_run:
             continue  # don't dump the existing backlog on startup
 
+        chat_id = number_index.get(r["number"])
         delivered = False
-        for chat_id in number_index.get(r["number"], []):
-            info = ACTIVE_NUMBERS.get(chat_id, {}).get(r["number"])
-            if not info or info.get("delivered"):
-                continue
-            info["delivered"] = True
-            delivered = True
+        if chat_id is not None:
+            batch = ACTIVE_BATCH.get(chat_id)
+            info = batch["numbers"].get(r["number"]) if batch else None
+            if info and info["status"] == "waiting":
+                code = extract_code(r["message"])
+                info["status"] = "delivered"
+                info["code"] = code
+                delivered = True
+                changed_chats.add(chat_id)
 
-            number = r["number"]
-            rng, label = info["rng"], info.get("label")
-            service = label.split(" / ")[0] if label else None
-            kb = number_card_kb(rng, number, service, label)
-            code = extract_code(r["message"])
-            header = f"*{label}*\n" if label else ""
-            text = f"🎉 *SMS Received*\n\n{header}📞 `{number}`\n💬 {r['message']}"
-            if code:
-                text += f"\n\n🔑 *CODE*\n```\n{code}\n```"
-            msg_id = await _update_status(chat_id, number, context, text, reply_markup=kb)
-
-            group_text = f"📨 *{r['sender']}* — `{number}`\n{r['message']}"
-            if code:
-                group_text += f"\n*Code:* `{code}`"
-            await post_to_group(context, group_text)
-
-            if msg_id is not None:
-                asyncio.create_task(_vanish_later(context, chat_id, msg_id, delay=60))
-            ACTIVE_NUMBERS[chat_id].pop(number, None)
+                group_text = f"📨 *{r['sender']}* — `{r['number']}`\n{r['message']}"
+                if code:
+                    group_text += f"\n*Code:* `{code}`"
+                await post_to_group(context, group_text)
 
         if not delivered:
             code = extract_code(r["message"])
@@ -867,16 +857,20 @@ async def central_updates_poller(context: ContextTypes.DEFAULT_TYPE):
     if len(SEEN_FEED_KEYS) > 5000:
         SEEN_FEED_KEYS.clear()
 
-    # Expire any active number whose time ran out and never got a code.
+    # Expire any waiting number whose time ran out and never got a code.
     now_ms = int(time.time() * 1000)
-    for chat_id, nums in list(ACTIVE_NUMBERS.items()):
-        for number, info in list(nums.items()):
-            if now_ms > info["expires_ms"]:
-                rng, label = info["rng"], info.get("label")
-                service = label.split(" / ")[0] if label else None
-                kb = number_card_kb(rng, number, service, label)
-                await _update_status(chat_id, number, context, f"⌛ `{number}` expired with no code received.", reply_markup=kb)
-                nums.pop(number, None)
+    for chat_id, batch in ACTIVE_BATCH.items():
+        for number, info in batch["numbers"].items():
+            if info["status"] == "waiting" and now_ms > info["expires_ms"]:
+                info["status"] = "expired"
+                changed_chats.add(chat_id)
+
+    for chat_id in changed_chats:
+        await _render_batch(chat_id, context)
+        batch = ACTIVE_BATCH.get(chat_id)
+        if batch and all(info["status"] != "waiting" for info in batch["numbers"].values()):
+            asyncio.create_task(_vanish_later(context, chat_id, batch["message_id"], delay=60))
+            ACTIVE_BATCH.pop(chat_id, None)
 
 
 async def auto_poll_liveaccess(context: ContextTypes.DEFAULT_TYPE):
@@ -959,7 +953,7 @@ async def admin_callback_router(update: Update, context: ContextTypes.DEFAULT_TY
         text = (
             "📊 *Stats*\n\n"
             f"👥 Known users: {len(KNOWN_USERS)}\n"
-            f"⌛ Active waits: {sum(len(v) for v in ACTIVE_NUMBERS.values())}\n"
+            f"⌛ Active waits: {sum(len(b['numbers']) for b in ACTIVE_BATCH.values())}\n"
             f"📱 Numbers allocated this run: {NUMBERS_ALLOCATED}\n"
             f"🧩 Services configured: {len(services)}\n\n"
             "_Counts reset if the bot restarts (in-memory only)._"
@@ -1218,7 +1212,7 @@ def main():
 
     app.add_handler(CallbackQueryHandler(admin_callback_router, pattern=r"^adm:"))
     app.add_handler(CallbackQueryHandler(service_callback_router, pattern=r"^(svc|customrange)"))
-    app.add_handler(CallbackQueryHandler(raw_callback_router, pattern=r"^(sender:|getnum:|delnum:|backtosenders)"))
+    app.add_handler(CallbackQueryHandler(raw_callback_router, pattern=r"^(sender:|getnum:|delbatch|backtosenders)"))
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
     app.add_error_handler(global_error_handler)
