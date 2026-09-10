@@ -398,7 +398,18 @@ async def show_countries(query, service):
         return
 
     hits = CONFIG.get("range_hits", {})
-    ordered = sorted(countries.items(), key=lambda kv: hits.get(kv[1], 0), reverse=True)
+
+    def base_name(country):
+        return country.split(" (")[0]
+
+    groups = {}
+    for country, rng in countries.items():
+        groups.setdefault(base_name(country), []).append((country, rng))
+    for group in groups.values():
+        group.sort(key=lambda cr: hits.get(cr[1], 0), reverse=True)
+    ordered_groups = sorted(groups.items(), key=lambda kv: sum(hits.get(r, 0) for _, r in kv[1]), reverse=True)
+    ordered = [cr for _, group in ordered_groups for cr in group]
+
     buttons = [
         [InlineKeyboardButton(country, callback_data=f"svccountry:{service}:{country}")]
         for country, _rng in ordered
@@ -517,9 +528,7 @@ async def raw_callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     elif data.startswith("delnum:"):
         number = data.split(":", 1)[1]
-        info = ACTIVE_NUMBERS.get(chat_id, {}).pop(number, None)
-        if info and not info["task"].done():
-            info["task"].cancel()
+        ACTIVE_NUMBERS.get(chat_id, {}).pop(number, None)
         try:
             await query.edit_message_text(f"🗑 Deleted `{number}`.", parse_mode=ParseMode.MARKDOWN)
         except Exception:
@@ -554,9 +563,6 @@ async def start_getnum_flow(chat_id, rng, context, edit_query=None, label=None):
     global NUMBERS_ALLOCATED
 
     active = ACTIVE_NUMBERS.setdefault(chat_id, {})
-    active = {num: info for num, info in active.items() if not info["task"].done()}
-    ACTIVE_NUMBERS[chat_id] = active
-
     limit = CONFIG.get("max_per_user", 1)
     if len(active) >= limit:
         msg = f"⏳ You already have {limit} active number(s) — cancel one with /cancel first, or wait for it to finish."
@@ -610,8 +616,14 @@ async def start_getnum_flow(chat_id, rng, context, edit_query=None, label=None):
 
     message_id = getattr(sent, "message_id", None)
 
-    task = asyncio.create_task(_wait_for_code(chat_id, number, rng, expires_ms, context, label))
-    ACTIVE_NUMBERS[chat_id][number] = {"task": task, "message_id": message_id, "rng": rng}
+    # No per-number polling loop anymore — a single shared background job
+    # (central_updates_poller) checks getupdate once per cycle and delivers
+    # to every active number that matches, which is what keeps the bot fast
+    # even with many numbers active at once.
+    ACTIVE_NUMBERS[chat_id][number] = {
+        "message_id": message_id, "rng": rng, "label": label,
+        "expires_ms": expires_ms, "delivered": False,
+    }
 
 
 async def _update_status(chat_id, number, context, text, reply_markup=None):
@@ -640,52 +652,6 @@ async def _vanish_later(context, chat_id, message_id, delay=60):
         pass
 
 
-async def _wait_for_code(chat_id, number, rng, expires_ms, context, label=None):
-    try:
-        seen_data = await api_call("GET", "/publicapi/getupdate")
-        seen = {(r["number"], r["message"], r["at_ms"]) for r in seen_data.get("rows", [])}
-    except Exception:
-        seen = set()
-
-    service = label.split(" / ")[0] if label else None
-    again_kb = number_card_kb(rng, number, service, label)
-
-    try:
-        while True:
-            if int(time.time() * 1000) > expires_ms:
-                await _update_status(chat_id, number, context, f"⌛ `{number}` expired with no code received.", reply_markup=again_kb)
-                return
-            try:
-                data = await api_call("GET", "/publicapi/getupdate")
-            except Exception as e:
-                await _update_status(chat_id, number, context, f"⚠️ Error polling for code: {e}")
-                return
-
-            for r in data.get("rows", []):
-                key = (r["number"], r["message"], r["at_ms"])
-                if r["number"] == number and key not in seen:
-                    code = extract_code(r["message"])
-                    header = f"*{label}*\n" if label else ""
-                    text = f"🎉 *SMS Received*\n\n{header}📞 `{number}`\n💬 {r['message']}"
-                    if code:
-                        text += f"\n\n🔑 *CODE*\n```\n{code}\n```"
-                    msg_id = await _update_status(chat_id, number, context, text, reply_markup=again_kb)
-
-                    group_text = f"📨 *{r['sender']}* — `{number}`\n{r['message']}"
-                    if code:
-                        group_text += f"\n*Code:* `{code}`"
-                    await post_to_group(context, group_text)
-
-                    if msg_id is not None:
-                        asyncio.create_task(_vanish_later(context, chat_id, msg_id, delay=60))
-                    return
-            await asyncio.sleep(3)
-    except asyncio.CancelledError:
-        return
-    finally:
-        ACTIVE_NUMBERS.get(chat_id, {}).pop(number, None)
-
-
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     cleared = False
@@ -693,10 +659,9 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if USER_STATE.pop(chat_id, None) is not None:
         cleared = True
 
-    for number, info in list(ACTIVE_NUMBERS.get(chat_id, {}).items()):
-        if not info["task"].done():
-            info["task"].cancel()
-            cleared = True
+    if ACTIVE_NUMBERS.get(chat_id):
+        ACTIVE_NUMBERS[chat_id].clear()
+        cleared = True
 
     if cleared:
         await update.message.reply_text("🛑 Stopped / cancelled.")
@@ -822,54 +787,96 @@ def _range_already_known(rng):
     return False
 
 
-async def auto_poll_getupdate_feed(context: ContextTypes.DEFAULT_TYPE):
-    """Background job: mirrors every genuinely new incoming SMS into the live-feed
-    group, with the OTP code masked out so it can't be grabbed by someone else —
-    only service/country/sender/range info is shown. Only ever shows a Range
-    that's a real, already-verified entry from our services list, so anyone
-    copying it into Custom Range gets a working range."""
+async def central_updates_poller(context: ContextTypes.DEFAULT_TYPE):
+    """The ONE place that polls getupdate. Replaces per-number polling loops —
+    this is what keeps the bot fast even with many numbers active at once.
+
+    Each poll cycle:
+      1. Fetches getupdate once.
+      2. Delivers the code to any active number waiting on it (updates that
+         card, posts a copy to the group, schedules the vanish-delete).
+      3. Anything not matching an active number goes to the group as a masked
+         (code-hidden) live-activity post instead.
+      4. Also expires any active number whose time ran out.
+    """
     try:
         data = await api_call("GET", "/publicapi/getupdate")
     except Exception as e:
-        logger.info("auto_poll_getupdate_feed: getupdate call failed (%s) — will retry next cycle.", e)
-        return
+        logger.info("central_updates_poller: getupdate call failed (%s) — will retry next cycle.", e)
+        data = None
 
     rows = data.get("rows", []) if data else []
-    if not rows:
-        return
-
     first_run = not SEEN_FEED_KEYS
-    # Process oldest-first so the group feed reads in chronological order.
-    for r in reversed(rows):
+
+    # number -> list of chat_ids currently waiting on that exact number
+    number_index = {}
+    for chat_id, nums in ACTIVE_NUMBERS.items():
+        for number in nums:
+            number_index.setdefault(number, []).append(chat_id)
+
+    for r in reversed(rows):  # oldest-first so the feed reads chronologically
         key = (r["number"], r["message"], r["at_ms"])
         if key in SEEN_FEED_KEYS:
             continue
         SEEN_FEED_KEYS.add(key)
-
         if first_run:
-            continue  # don't dump the whole existing backlog into the group on startup
+            continue  # don't dump the existing backlog on startup
 
-        code = extract_code(r["message"])
-        masked = mask_code_in_message(r["message"], code)
-        service = detect_service(r["message"]) or "Unknown"
-        country = r.get("country") or "Unknown"
-        flag = flag_emoji(country)
-        known_range = find_known_range_for_country(country)
+        delivered = False
+        for chat_id in number_index.get(r["number"], []):
+            info = ACTIVE_NUMBERS.get(chat_id, {}).get(r["number"])
+            if not info or info.get("delivered"):
+                continue
+            info["delivered"] = True
+            delivered = True
 
-        lines = [
-            "🆕 *New Activity*",
-            f"⚙️ Service: {service}",
-            f"🌍 Country: {country} {flag}".strip(),
-        ]
-        if known_range:
-            lines.append(f"📱 Range: `{known_range}`")
-        lines.append(f"✉️ Full SMS:\n{masked}")
+            number = r["number"]
+            rng, label = info["rng"], info.get("label")
+            service = label.split(" / ")[0] if label else None
+            kb = number_card_kb(rng, number, service, label)
+            code = extract_code(r["message"])
+            header = f"*{label}*\n" if label else ""
+            text = f"🎉 *SMS Received*\n\n{header}📞 `{number}`\n💬 {r['message']}"
+            if code:
+                text += f"\n\n🔑 *CODE*\n```\n{code}\n```"
+            msg_id = await _update_status(chat_id, number, context, text, reply_markup=kb)
 
-        await post_to_group(context, "\n".join(lines))
+            group_text = f"📨 *{r['sender']}* — `{number}`\n{r['message']}"
+            if code:
+                group_text += f"\n*Code:* `{code}`"
+            await post_to_group(context, group_text)
 
-    # Keep the seen-set from growing forever across a long-running process.
+            if msg_id is not None:
+                asyncio.create_task(_vanish_later(context, chat_id, msg_id, delay=60))
+            ACTIVE_NUMBERS[chat_id].pop(number, None)
+
+        if not delivered:
+            code = extract_code(r["message"])
+            masked = mask_code_in_message(r["message"], code)
+            service = detect_service(r["message"]) or "Unknown"
+            country = r.get("country") or "Unknown"
+            flag = flag_emoji(country)
+            known_range = find_known_range_for_country(country)
+
+            lines = ["🆕 *New Activity*", f"⚙️ Service: {service}", f"🌍 Country: {country} {flag}".strip()]
+            if known_range:
+                lines.append(f"📱 Range: `{known_range}`")
+            lines.append(f"✉️ Full SMS:\n{masked}")
+            await post_to_group(context, "\n".join(lines))
+
     if len(SEEN_FEED_KEYS) > 5000:
         SEEN_FEED_KEYS.clear()
+
+    # Expire any active number whose time ran out and never got a code.
+    now_ms = int(time.time() * 1000)
+    for chat_id, nums in list(ACTIVE_NUMBERS.items()):
+        for number, info in list(nums.items()):
+            if now_ms > info["expires_ms"]:
+                rng, label = info["rng"], info.get("label")
+                service = label.split(" / ")[0] if label else None
+                kb = number_card_kb(rng, number, service, label)
+                await _update_status(chat_id, number, context, f"⌛ `{number}` expired with no code received.", reply_markup=kb)
+                nums.pop(number, None)
 
 
 async def auto_poll_liveaccess(context: ContextTypes.DEFAULT_TYPE):
@@ -1218,7 +1225,7 @@ def main():
 
     if app.job_queue is not None:
         app.job_queue.run_repeating(auto_poll_liveaccess, interval=AUTO_POLL_SECONDS, first=15)
-        app.job_queue.run_repeating(auto_poll_getupdate_feed, interval=FEED_POLL_SECONDS, first=10)
+        app.job_queue.run_repeating(central_updates_poller, interval=FEED_POLL_SECONDS, first=10)
     else:
         print("⚠️  JobQueue not available — install with 'pip install \"python-telegram-bot[job-queue]\"' for auto-detection.")
 
