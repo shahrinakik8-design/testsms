@@ -834,13 +834,23 @@ async def central_updates_poller(context: ContextTypes.DEFAULT_TYPE):
 
                 # A fresh message (not an edit) so Telegram actually pings the
                 # user — editing the batch card alone stays silent on-device.
-                notify_text = f"🔔 *Code Received!*\n📞 `{r['number']}`"
-                if code:
-                    notify_text += f"\n🔑 Code: `{code}`"
-                notify_text += f"\n💬 {r['message']}"
+                rng, label = batch["rng"], batch.get("label")
+                service = label.split(" / ")[0] if label else None
+                again_data = f"getnum:{rng}|{label}" if label else f"getnum:{rng}"
+                notify_kb = InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🔄 Get Same Country New Number", callback_data=again_data)
+                ]])
+
+                notify_text = (
+                    f"🎉 *Code Received!*\n\n"
+                    f"📞 *Number:*\n`{r['number']}`\n\n"
+                    f"💬 *Message:*\n{r['message']}\n\n"
+                    f"🔑 *Code:*\n```\n{code or '—'}\n```"
+                )
                 try:
-                    ping = await context.bot.send_message(chat_id, notify_text, parse_mode=ParseMode.MARKDOWN)
-                    asyncio.create_task(_vanish_later(context, chat_id, ping.message_id, delay=60))
+                    await context.bot.send_message(
+                        chat_id, notify_text, parse_mode=ParseMode.MARKDOWN, reply_markup=notify_kb
+                    )
                 except Exception:
                     pass
 
@@ -892,7 +902,8 @@ async def central_updates_poller(context: ContextTypes.DEFAULT_TYPE):
         await _render_batch(chat_id, context)
         batch = ACTIVE_BATCH.get(chat_id)
         if batch and all(info["status"] != "waiting" for info in batch["numbers"].values()):
-            asyncio.create_task(_vanish_later(context, chat_id, batch["message_id"], delay=60))
+            # Card stays visible permanently (number + code + buttons) — only
+            # the separate ping notification message vanishes, not this one.
             ACTIVE_BATCH.pop(chat_id, None)
 
 
