@@ -258,7 +258,24 @@ def find_known_range_for_country(country):
 def mask_code_in_message(message, code):
     if not code:
         return message
-    return message.replace(code, "*" * len(code))
+    # Use bullets, not asterisks — asterisks are Markdown emphasis markers and
+    # would break message formatting (silently, from Telegram's point of view).
+    return message.replace(code, "•" * len(code))
+
+
+_MD_SPECIAL = ("\\", "_", "*", "`", "[")
+
+
+def md_escape(text):
+    """Escape legacy-Markdown special characters in dynamic/user-supplied text
+    before interpolating it into a parse_mode=MARKDOWN message. Without this,
+    an SMS body containing e.g. a stray '*' or '_' makes Telegram reject the
+    whole send_message call with a parse error — which, wrapped in a bare
+    try/except, looks exactly like 'nothing happened'."""
+    text = str(text)
+    for ch in _MD_SPECIAL:
+        text = text.replace(ch, "\\" + ch)
+    return text
 
 
 def load_services():
@@ -574,19 +591,28 @@ def batch_kb(rng, label, service=None):
 
 
 async def _render_batch(chat_id, context):
+    """Re-sends the batch card as a fresh message at the bottom of the chat
+    (deleting the old one) instead of editing it in place — so it's easy to
+    find again next to the newest messages instead of staying stuck wherever
+    it was originally sent."""
     batch = ACTIVE_BATCH.get(chat_id)
     if not batch:
         return
     service = batch["label"].split(" / ")[0] if batch.get("label") else None
     text = render_batch_text(batch)
     kb = batch_kb(batch["rng"], batch.get("label"), service)
+
+    old_message_id = batch.get("message_id")
     try:
-        await context.bot.edit_message_text(
-            chat_id=chat_id, message_id=batch["message_id"], text=text,
-            parse_mode=ParseMode.MARKDOWN, reply_markup=kb,
-        )
-    except Exception:
-        pass
+        sent = await context.bot.send_message(chat_id, text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
+        batch["message_id"] = getattr(sent, "message_id", old_message_id)
+        if old_message_id is not None:
+            try:
+                await context.bot.delete_message(chat_id, old_message_id)
+            except Exception:
+                pass
+    except Exception as e:
+        logger.error("Failed to re-send batch card for %s: %s", chat_id, e)
 
 
 async def start_getnum_flow(chat_id, rng, context, edit_query=None, label=None):
@@ -841,27 +867,28 @@ async def central_updates_poller(context: ContextTypes.DEFAULT_TYPE):
                     InlineKeyboardButton("🔄 Get Same Country New Number", callback_data=again_data)
                 ]])
 
+                safe_message = md_escape(r["message"])
                 notify_text = (
                     f"🎉 *Code Received!*\n\n"
                     f"📞 *Number:*\n`{r['number']}`\n\n"
-                    f"💬 *Message:*\n{r['message']}\n\n"
+                    f"💬 *Message:*\n{safe_message}\n\n"
                     f"🔑 *Code:*\n```\n{code or '—'}\n```"
                 )
                 try:
                     await context.bot.send_message(
                         chat_id, notify_text, parse_mode=ParseMode.MARKDOWN, reply_markup=notify_kb
                     )
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.error("Failed to send code-received notification to %s: %s", chat_id, e)
 
                 group_text = (
                     "🎉 *Code Delivered!* 🎉\n\n"
-                    f"📡 Sender: *{r['sender']}*\n"
+                    f"📡 Sender: *{md_escape(r['sender'])}*\n"
                     f"📞 Number: `{r['number']}`\n"
                 )
                 if code:
                     group_text += f"🔑 Code: `{code}`\n"
-                group_text += f"💬 {r['message']}"
+                group_text += f"💬 {safe_message}"
                 await post_to_group(context, group_text)
 
         if not delivered:
@@ -877,12 +904,12 @@ async def central_updates_poller(context: ContextTypes.DEFAULT_TYPE):
             lines = [
                 "🟢 *NEW ACTIVE RANGE* ✅",
                 "",
-                f"⚙️ Service: *{service}*",
-                f"🌍 Country: *{country}* {flag}".strip(),
+                f"⚙️ Service: *{md_escape(service)}*",
+                f"🌍 Country: *{md_escape(country)}* {flag}".strip(),
             ]
             if known_range:
                 lines.append(f"📱 Range: `{known_range}`")
-            lines.append(f"✉️ Full SMS:\n{masked}")
+            lines.append(f"✉️ Full SMS:\n{md_escape(masked)}")
             if GROUP_LINK:
                 lines.append(f"\n🔍 [Join / Number Bot]({GROUP_LINK})")
             await post_to_group(context, "\n".join(lines))
