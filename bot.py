@@ -397,7 +397,7 @@ async def show_countries(query, service):
         )
         return
 
-    hits = CONFIG.get("range_hits", {})
+    last_seen = CONFIG.get("range_last_seen", {})
 
     def base_name(country):
         return country.split(" (")[0]
@@ -406,8 +406,8 @@ async def show_countries(query, service):
     for country, rng in countries.items():
         groups.setdefault(base_name(country), []).append((country, rng))
     for group in groups.values():
-        group.sort(key=lambda cr: hits.get(cr[1], 0), reverse=True)
-    ordered_groups = sorted(groups.items(), key=lambda kv: sum(hits.get(r, 0) for _, r in kv[1]), reverse=True)
+        group.sort(key=lambda cr: last_seen.get(cr[1], 0), reverse=True)
+    ordered_groups = sorted(groups.items(), key=lambda kv: max(last_seen.get(r, 0) for _, r in kv[1]), reverse=True)
     ordered = [cr for _, group in ordered_groups for cr in group]
 
     buttons = [
@@ -592,14 +592,9 @@ async def _render_batch(chat_id, context):
 async def start_getnum_flow(chat_id, rng, context, edit_query=None, label=None):
     global NUMBERS_ALLOCATED
 
-    existing = ACTIVE_BATCH.get(chat_id)
-    if existing and any(info["status"] == "waiting" for info in existing["numbers"].values()):
-        msg = "⏳ You already have numbers waiting — cancel with /cancel first, or wait for them to finish."
-        if edit_query:
-            await edit_query.edit_message_text(msg)
-        else:
-            await context.bot.send_message(chat_id, msg)
-        return
+    # A fresh request (initial pick, "Get New Batch", or "Change Country") always
+    # replaces whatever was active before — no blocking guard here anymore.
+    ACTIVE_BATCH.pop(chat_id, None)
 
     count = max(1, CONFIG.get("max_per_user", 1))
     allocated = []
@@ -722,7 +717,7 @@ def admin_menu_kb():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📊 Stats", callback_data="adm:stats")],
         [InlineKeyboardButton("🧩 Manage Services", callback_data="adm:services")],
-        [InlineKeyboardButton(f"🔢 Per-user limit: {CONFIG.get('max_per_user', 1)}", callback_data="adm:setlimit")],
+        [InlineKeyboardButton(f"🔢 Numbers per request: {CONFIG.get('max_per_user', 1)}", callback_data="adm:setlimit")],
         [InlineKeyboardButton("📢 Broadcast", callback_data="adm:broadcast")],
         [InlineKeyboardButton("⬅️ Close", callback_data="adm:close")],
     ])
@@ -818,11 +813,13 @@ async def central_updates_poller(context: ContextTypes.DEFAULT_TYPE):
     for r in reversed(rows):  # oldest-first so the feed reads chronologically
         key = (r["number"], r["message"], r["at_ms"])
         if key in SEEN_FEED_KEYS:
-            continue
+            continue  # genuinely already processed in an earlier cycle
         SEEN_FEED_KEYS.add(key)
-        if first_run:
-            continue  # don't dump the existing backlog on startup
 
+        # Always attempt delivery to a waiting active number, even on the very
+        # first poll after a restart — this is what used to get silently
+        # swallowed by the old "first_run: skip everything" logic, which meant
+        # a code could arrive right as the bot restarted and just vanish.
         chat_id = number_index.get(r["number"])
         delivered = False
         if chat_id is not None:
@@ -835,12 +832,31 @@ async def central_updates_poller(context: ContextTypes.DEFAULT_TYPE):
                 delivered = True
                 changed_chats.add(chat_id)
 
-                group_text = f"📨 *{r['sender']}* — `{r['number']}`\n{r['message']}"
+                # A fresh message (not an edit) so Telegram actually pings the
+                # user — editing the batch card alone stays silent on-device.
+                notify_text = f"🔔 *Code Received!*\n📞 `{r['number']}`"
                 if code:
-                    group_text += f"\n*Code:* `{code}`"
+                    notify_text += f"\n🔑 Code: `{code}`"
+                notify_text += f"\n💬 {r['message']}"
+                try:
+                    ping = await context.bot.send_message(chat_id, notify_text, parse_mode=ParseMode.MARKDOWN)
+                    asyncio.create_task(_vanish_later(context, chat_id, ping.message_id, delay=60))
+                except Exception:
+                    pass
+
+                group_text = (
+                    "🎉 *Code Delivered!* 🎉\n\n"
+                    f"📡 Sender: *{r['sender']}*\n"
+                    f"📞 Number: `{r['number']}`\n"
+                )
+                if code:
+                    group_text += f"🔑 Code: `{code}`\n"
+                group_text += f"💬 {r['message']}"
                 await post_to_group(context, group_text)
 
         if not delivered:
+            if first_run:
+                continue  # suppress the generic group-feed backlog dump on startup only
             code = extract_code(r["message"])
             masked = mask_code_in_message(r["message"], code)
             service = detect_service(r["message"]) or "Unknown"
@@ -848,10 +864,17 @@ async def central_updates_poller(context: ContextTypes.DEFAULT_TYPE):
             flag = flag_emoji(country)
             known_range = find_known_range_for_country(country)
 
-            lines = ["🆕 *New Activity*", f"⚙️ Service: {service}", f"🌍 Country: {country} {flag}".strip()]
+            lines = [
+                "🟢 *NEW ACTIVE RANGE* ✅",
+                "",
+                f"⚙️ Service: *{service}*",
+                f"🌍 Country: *{country}* {flag}".strip(),
+            ]
             if known_range:
                 lines.append(f"📱 Range: `{known_range}`")
             lines.append(f"✉️ Full SMS:\n{masked}")
+            if GROUP_LINK:
+                lines.append(f"\n🔍 [Join / Number Bot]({GROUP_LINK})")
             await post_to_group(context, "\n".join(lines))
 
     if len(SEEN_FEED_KEYS) > 5000:
@@ -873,9 +896,14 @@ async def central_updates_poller(context: ContextTypes.DEFAULT_TYPE):
             ACTIVE_BATCH.pop(chat_id, None)
 
 
+STALE_RANGE_MS = 30 * 60 * 1000  # prune an auto-detected range if unseen for 30 minutes
+
+
 async def auto_poll_liveaccess(context: ContextTypes.DEFAULT_TYPE):
     """Background job: checks Zebra's liveaccess endpoint every few minutes and
-    self-adds any new range it finds under AUTO_SERVICE_NAME. Silently does
+    self-adds any new range it finds under AUTO_SERVICE_NAME, tracks how
+    recently each range was last seen (for recency-based sorting), and prunes
+    auto-detected ranges that have gone quiet for a while. Silently does
     nothing if liveaccess returns no data (e.g. while it's broken upstream) —
     it'll just start working the moment Zebra's endpoint starts returning rows."""
     try:
@@ -885,16 +913,17 @@ async def auto_poll_liveaccess(context: ContextTypes.DEFAULT_TYPE):
         return
 
     rows = data.get("rows", []) if data else []
-    if not rows:
-        return  # nothing live right now — this is normal, not an error
 
     newly_added = []
     services.setdefault(AUTO_SERVICE_NAME, {})
     hits = CONFIG.setdefault("range_hits", {})
+    last_seen = CONFIG.setdefault("range_last_seen", {})
+    now_ms = int(time.time() * 1000)
 
     for row in rows:
         for rng in row.get("ranges", []):
-            hits[rng] = hits.get(rng, 0) + 1  # track how often this range shows up live
+            hits[rng] = hits.get(rng, 0) + 1
+            last_seen[rng] = now_ms  # recency wins over raw hit count for sorting
             if _range_already_known(rng):
                 continue  # already saved somewhere (auto or manual) — don't duplicate
             country = guess_country_from_range(rng) or rng
@@ -906,10 +935,20 @@ async def auto_poll_liveaccess(context: ContextTypes.DEFAULT_TYPE):
             services[AUTO_SERVICE_NAME][country] = rng
             newly_added.append(f"{country} → {rng}")
 
+    # Prune auto-detected ranges that have gone quiet — keeps the list from
+    # growing forever with ranges that stopped delivering long ago.
+    pruned = []
+    auto_countries = services.get(AUTO_SERVICE_NAME, {})
+    for country, rng in list(auto_countries.items()):
+        if now_ms - last_seen.get(rng, 0) > STALE_RANGE_MS:
+            auto_countries.pop(country, None)
+            pruned.append(f"{country} ({rng})")
+
     save_config()
-    if newly_added:
+    if newly_added or pruned:
         save_services()
-        text = "🔎 *Auto-detected new range(s):*\n\n" + "\n".join(f"• {line}" for line in newly_added)
+    if newly_added:
+        text = "🟢 *NEW RANGE(S) DETECTED* 🔎\n\n" + "\n".join(f"✅ {line}" for line in newly_added)
         await post_to_group(context, text)
 
 
@@ -967,7 +1006,7 @@ async def admin_callback_router(update: Update, context: ContextTypes.DEFAULT_TY
     elif data == "adm:setlimit":
         ADMIN_STATE[chat_id] = ("set_limit", None)
         await query.edit_message_text(
-            f"🔢 Current limit: {CONFIG.get('max_per_user', 1)} number(s) per user at a time.\n"
+            f"🔢 Currently: {CONFIG.get('max_per_user', 1)} number(s) come together each time someone taps a service/country.\n"
             f"Send a new number to change it.\nSend /cancel to abort.",
         )
 
