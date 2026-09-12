@@ -89,6 +89,8 @@ FEED_POLL_SECONDS = 5      # getupdate is cached for 3s, so polling every 5s is 
 
 GROUP_USERNAME = os.environ.get("GROUP_USERNAME", "-1004415108815")
 GROUP_LINK = os.environ.get("GROUP_LINK", "https://t.me/otpmastersgrp")
+CHANNEL_USERNAME = os.environ.get("CHANNEL_USERNAME", "")  # e.g. "@your_channel" — required-join channel
+CHANNEL_LINK = os.environ.get("CHANNEL_LINK", "")
 
 # services = { "Facebook": { "Ivory Coast": "22501XXX", ... }, ... }
 services = {}
@@ -263,6 +265,18 @@ def mask_code_in_message(message, code):
     return message.replace(code, "•" * len(code))
 
 
+def mask_number_middle(number, visible_start=4, visible_end=3, mask_len=4):
+    """Masks the middle digits of a phone number — used only for the group
+    feed, never inside the private bot chat."""
+    digits_only = number.lstrip("+")
+    prefix = "+" if number.startswith("+") else ""
+    if len(digits_only) <= visible_start + visible_end:
+        return number
+    start = digits_only[:visible_start]
+    end = digits_only[-visible_end:]
+    return f"{prefix}{start}{'•' * mask_len}{end}"
+
+
 _MD_SPECIAL = ("\\", "_", "*", "`", "[")
 
 
@@ -336,6 +350,33 @@ def extract_code(message):
     return match.group(0) if match else None
 
 
+FORCE_JOIN_CHATS = [
+    (chat_id, link) for chat_id, link in [(GROUP_USERNAME, GROUP_LINK), (CHANNEL_USERNAME, CHANNEL_LINK)]
+    if chat_id and link
+]
+
+
+async def missing_required_joins(context, user_id):
+    """Returns the list of (chat_id, link) the user still needs to join.
+    Fails open (treats as joined) if the membership check itself errors out,
+    so a Telegram API hiccup never locks everyone out of the bot."""
+    missing = []
+    for chat_id, link in FORCE_JOIN_CHATS:
+        try:
+            member = await context.bot.get_chat_member(chat_id, user_id)
+            if member.status in ("left", "kicked"):
+                missing.append((chat_id, link))
+        except Exception as e:
+            logger.info("membership check failed for %s / %s: %s", chat_id, user_id, e)
+    return missing
+
+
+def join_required_kb(missing):
+    rows = [[InlineKeyboardButton(f"➡️ Join #{i+1}", url=link)] for i, (_cid, link) in enumerate(missing)]
+    rows.append([InlineKeyboardButton("✅ I've Joined", callback_data="checkjoin")])
+    return InlineKeyboardMarkup(rows)
+
+
 async def post_to_group(context, text):
     """Best-effort mirror of a message to the configured Telegram group.
     Never raises — a failure here should never break the main flow."""
@@ -366,9 +407,10 @@ def back_inline(target="noop"):
 # ── /start ───────────────────────────────────────────────────────────────
 
 WELCOME = (
-    "👋 *Zebra SMS Bot*\n\n"
-    "Grab a virtual number and receive its verification code, right here.\n\n"
-    "Use the buttons below 👇"
+    "🤖✨ *OTP MASTER BOT* ✨🤖\n"
+    "━━━━━━━━━━━━━━━━━━\n\n"
+    "📲 Grab a virtual number and get its verification code — instantly, right here.\n\n"
+    "👇 Use the buttons below to get started 👇"
 )
 
 
@@ -529,6 +571,14 @@ async def raw_callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE
     chat_id = query.message.chat_id
     KNOWN_USERS.add(chat_id)
 
+    if data == "checkjoin":
+        missing = await missing_required_joins(context, chat_id)
+        if missing:
+            await query.answer("Still missing one or more — join them and try again.", show_alert=True)
+            return
+        await query.edit_message_text("✅ Thanks! Tap 📱 Get Number below to continue.")
+        return
+
     if data.startswith("sender:"):
         await show_ranges_for_sender(query, data.split(":", 1)[1])
 
@@ -617,6 +667,17 @@ async def _render_batch(chat_id, context):
 
 async def start_getnum_flow(chat_id, rng, context, edit_query=None, label=None):
     global NUMBERS_ALLOCATED
+
+    if FORCE_JOIN_CHATS:
+        missing = await missing_required_joins(context, chat_id)
+        if missing:
+            msg = "🔒 Please join the group/channel below to use this bot, then tap *I've Joined*."
+            kb = join_required_kb(missing)
+            if edit_query:
+                await edit_query.edit_message_text(msg, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
+            else:
+                await context.bot.send_message(chat_id, msg, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
+            return
 
     # A fresh request (initial pick, "Get New Batch", or "Change Country") always
     # replaces whatever was active before — no blocking guard here anymore.
@@ -727,7 +788,8 @@ async def live_feed_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 HELP_TEXT = (
-    "ℹ️ *How it works*\n\n"
+    "ℹ️✨ *HOW IT WORKS* ✨\n"
+    "━━━━━━━━━━━━━━━━━━\n\n"
     "📱 *Get Number* — pick a service, then a country (or a custom range); the "
     "bot allocates a number and waits for its code automatically\n"
     "📡 *Browse Ranges* — see raw ranges by sender id (advanced/manual)\n"
@@ -884,7 +946,7 @@ async def central_updates_poller(context: ContextTypes.DEFAULT_TYPE):
                 group_text = (
                     "🎉 *Code Delivered!* 🎉\n\n"
                     f"📡 Sender: *{md_escape(r['sender'])}*\n"
-                    f"📞 Number: `{r['number']}`\n"
+                    f"📞 Number: `{mask_number_middle(r['number'])}`\n"
                 )
                 if code:
                     group_text += f"🔑 Code: `{code}`\n"
@@ -1289,7 +1351,7 @@ def main():
 
     app.add_handler(CallbackQueryHandler(admin_callback_router, pattern=r"^adm:"))
     app.add_handler(CallbackQueryHandler(service_callback_router, pattern=r"^(svc|customrange)"))
-    app.add_handler(CallbackQueryHandler(raw_callback_router, pattern=r"^(sender:|getnum:|delbatch|backtosenders)"))
+    app.add_handler(CallbackQueryHandler(raw_callback_router, pattern=r"^(sender:|getnum:|delbatch|backtosenders|checkjoin)"))
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
     app.add_error_handler(global_error_handler)
