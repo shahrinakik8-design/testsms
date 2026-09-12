@@ -89,8 +89,10 @@ FEED_POLL_SECONDS = 5      # getupdate is cached for 3s, so polling every 5s is 
 
 GROUP_USERNAME = os.environ.get("GROUP_USERNAME", "-1004415108815")
 GROUP_LINK = os.environ.get("GROUP_LINK", "https://t.me/otpmastersgrp")
-CHANNEL_USERNAME = os.environ.get("CHANNEL_USERNAME", "")  # e.g. "@your_channel" — required-join channel
-CHANNEL_LINK = os.environ.get("CHANNEL_LINK", "")
+CHANNEL_USERNAME = os.environ.get("METHOD_CHANNEL_USERNAME", os.environ.get("CHANNEL_USERNAME", ""))
+CHANNEL_LINK = os.environ.get("METHOD_CHANNEL_LINK", os.environ.get("CHANNEL_LINK", ""))
+BACKUP_CHANNEL_USERNAME = os.environ.get("BACKUP_CHANNEL_USERNAME", "")
+BACKUP_CHANNEL_LINK = os.environ.get("BACKUP_CHANNEL_LINK", "")
 
 # services = { "Facebook": { "Ivory Coast": "22501XXX", ... }, ... }
 services = {}
@@ -351,30 +353,61 @@ def extract_code(message):
 
 
 FORCE_JOIN_CHATS = [
-    (chat_id, link) for chat_id, link in [(GROUP_USERNAME, GROUP_LINK), (CHANNEL_USERNAME, CHANNEL_LINK)]
+    (label, chat_id, link)
+    for label, chat_id, link in [
+        ("OTP/Range Group", GROUP_USERNAME, GROUP_LINK),
+        ("Method Channel", CHANNEL_USERNAME, CHANNEL_LINK),
+        ("Backup Channel", BACKUP_CHANNEL_USERNAME, BACKUP_CHANNEL_LINK),
+    ]
     if chat_id and link
 ]
 
 
 async def missing_required_joins(context, user_id):
-    """Returns the list of (chat_id, link) the user still needs to join.
+    """Returns the list of (label, chat_id, link) the user still needs to join.
     Fails open (treats as joined) if the membership check itself errors out,
     so a Telegram API hiccup never locks everyone out of the bot."""
     missing = []
-    for chat_id, link in FORCE_JOIN_CHATS:
+    for label, chat_id, link in FORCE_JOIN_CHATS:
         try:
             member = await context.bot.get_chat_member(chat_id, user_id)
             if member.status in ("left", "kicked"):
-                missing.append((chat_id, link))
+                missing.append((label, chat_id, link))
         except Exception as e:
             logger.info("membership check failed for %s / %s: %s", chat_id, user_id, e)
     return missing
 
 
 def join_required_kb(missing):
-    rows = [[InlineKeyboardButton(f"➡️ Join #{i+1}", url=link)] for i, (_cid, link) in enumerate(missing)]
+    rows = [[InlineKeyboardButton(f"➡️ Join {label}", url=link)] for label, _cid, link in missing]
     rows.append([InlineKeyboardButton("✅ I've Joined", callback_data="checkjoin")])
     return InlineKeyboardMarkup(rows)
+
+
+async def enforce_join_or_prompt(chat_id, context, edit_query=None, user_id=None):
+    """The single choke point for the force-join gate. Returns True if the
+    caller may proceed. Admins are always exempt. Returns False after already
+    sending/editing the 'please join' prompt, so the caller should just
+    `return` when this comes back False."""
+    if is_admin(user_id if user_id is not None else chat_id):
+        return True
+    if not FORCE_JOIN_CHATS:
+        return True
+
+    missing = await missing_required_joins(context, chat_id)
+    if not missing:
+        return True
+
+    msg = "🔒 *Access Locked*\n\nJoin *all* of the following to use this bot, then tap *I've Joined*:"
+    kb = join_required_kb(missing)
+    if edit_query:
+        try:
+            await edit_query.edit_message_text(msg, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
+        except Exception:
+            await context.bot.send_message(chat_id, msg, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
+    else:
+        await context.bot.send_message(chat_id, msg, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
+    return False
 
 
 async def post_to_group(context, text):
@@ -415,7 +448,10 @@ WELCOME = (
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    KNOWN_USERS.add(update.effective_chat.id)
+    chat_id = update.effective_chat.id
+    KNOWN_USERS.add(chat_id)
+    if not await enforce_join_or_prompt(chat_id, context, user_id=update.effective_user.id):
+        return
     await update.message.reply_text(
         WELCOME, parse_mode=ParseMode.MARKDOWN, reply_markup=main_kb(update.effective_user.id)
     )
@@ -487,6 +523,9 @@ async def service_callback_router(update: Update, context: ContextTypes.DEFAULT_
     data = query.data
     chat_id = query.message.chat_id
     KNOWN_USERS.add(chat_id)
+
+    if not await enforce_join_or_prompt(chat_id, context, edit_query=query, user_id=query.from_user.id):
+        return
 
     if data == "customrange":
         USER_STATE[chat_id] = "awaiting_custom_range"
@@ -579,6 +618,9 @@ async def raw_callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE
         await query.edit_message_text("✅ Thanks! Tap 📱 Get Number below to continue.")
         return
 
+    if not await enforce_join_or_prompt(chat_id, context, edit_query=query, user_id=query.from_user.id):
+        return
+
     if data.startswith("sender:"):
         await show_ranges_for_sender(query, data.split(":", 1)[1])
 
@@ -668,16 +710,8 @@ async def _render_batch(chat_id, context):
 async def start_getnum_flow(chat_id, rng, context, edit_query=None, label=None):
     global NUMBERS_ALLOCATED
 
-    if FORCE_JOIN_CHATS:
-        missing = await missing_required_joins(context, chat_id)
-        if missing:
-            msg = "🔒 Please join the group/channel below to use this bot, then tap *I've Joined*."
-            kb = join_required_kb(missing)
-            if edit_query:
-                await edit_query.edit_message_text(msg, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
-            else:
-                await context.bot.send_message(chat_id, msg, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
-            return
+    if not await enforce_join_or_prompt(chat_id, context, edit_query=edit_query):
+        return
 
     # A fresh request (initial pick, "Get New Batch", or "Change Country") always
     # replaces whatever was active before — no blocking guard here anymore.
@@ -752,7 +786,10 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ── Codes list ───────────────────────────────────────────────────────────
 
 async def codes_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    KNOWN_USERS.add(update.effective_chat.id)
+    chat_id = update.effective_chat.id
+    KNOWN_USERS.add(chat_id)
+    if not await enforce_join_or_prompt(chat_id, context, user_id=update.effective_user.id):
+        return
     try:
         data = await api_call("GET", "/publicapi/getupdate")
     except Exception as e:
@@ -1284,6 +1321,9 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Admin multi-step flows take priority over button labels
     if await admin_text_handler(update, context):
+        return
+
+    if not await enforce_join_or_prompt(chat_id, context, user_id=update.effective_user.id):
         return
 
     # Regular-user "custom range" entry takes priority over button labels too
