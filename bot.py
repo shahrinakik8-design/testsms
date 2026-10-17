@@ -35,6 +35,23 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKe
 from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes  # <--- এখানে Application আছে কিনা নিশ্চিত করুন
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+# স্টার্ট কমান্ড হ্যান্ডলার ফাংশন
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_name = update.effective_user.first_name
+    welcome_text = (
+        f"হ্যালো {user_name}! 👋\n\n"
+        "আমাদের এসএমএস আর্নিং বটে আপনাকে স্বাগতম। "
+        "নিচের বাটন থেকে আপনার সার্ভিস সিলেক্ট করুন:"
+    )
+    
+    # স্যাম্পল বাটন (আপনার প্রয়োজনমতো পরিবর্তন করতে পারেন)
+    keyboard = [
+        [InlineKeyboardButton("📱 Get Number", callback_data="get_number")],
+        [InlineKeyboardButton("🔄 Check Update", callback_data="check_update")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await update.message.reply_text(welcome_text, reply_markup=reply_markup)
 if __name__ == "__main__":
     # ১. টেলিগ্রাম অ্যাপ্লিকেশন অবজেক্ট তৈরি (এটি মিসিং ছিল)
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
