@@ -36,7 +36,7 @@ from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes  # <--- এখানে Application আছে কিনা নিশ্চিত করুন
 if __name__ == "__main__":
     # ১. টেলিগ্রাম অ্যাপ্লিকেশন অবজেক্ট তৈরি (এটি মিসিং ছিল)
-    application = Application.builder().token(BOT_TOKEN).build()
+    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
     # ২. হ্যান্ডলারগুলো যুক্ত করা
     application.add_handler(CommandHandler("start", start))
