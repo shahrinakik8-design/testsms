@@ -34,6 +34,7 @@ from flask import Flask
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
 from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes  # <--- এখানে Application আছে কিনা নিশ্চিত করুন
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 if __name__ == "__main__":
     # ১. টেলিগ্রাম অ্যাপ্লিকেশন অবজেক্ট তৈরি (এটি মিসিং ছিল)
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
