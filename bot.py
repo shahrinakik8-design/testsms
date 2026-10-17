@@ -16,9 +16,12 @@ Users then pick a service, then a country, and the bot allocates a number
 from the mapped range automatically.
 
 NOTE ON PERSISTENCE: services.json is written next to this script. On
-platforms without a persistent disk (e.g. Railway without a volume), this
-file resets on every redeploy. Attach a volume mounted at this script's
-directory if you need the service/country list to survive restarts.
+platforms without a persistent disk (e.g. Render free tier without a disk), this
+file resets on every redeploy. Attach a disk mounted at this script's
+directory (or set DATA_DIR) if you need the service/country list to survive restarts.
+
+HEALTH ENDPOINT: a tiny HTTP server answers "ok" on the PORT env var (Render sets
+this automatically). Point cron-job.org at your Render URL so the service stays awake.
 """
 
 import os
@@ -27,8 +30,10 @@ import json
 import time
 import asyncio
 import logging
+import threading
 import traceback
 import requests
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
 from telegram.constants import ParseMode
 from telegram.ext import (
@@ -312,6 +317,37 @@ def save_services():
             json.dump(services, f, ensure_ascii=False, indent=2)
     except OSError as e:
         print(f"Could not save services.json: {e}")
+
+
+# ── Health server (for Render + cron-job.org keep-alive) ────────────────
+
+class HealthHandler(BaseHTTPRequestHandler):
+    """Answers every GET/HEAD with a tiny 'ok' so cron-job.org never sees a
+    large response."""
+
+    def do_GET(self):
+        body = b"ok"
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_HEAD(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.send_header("Content-Length", "2")
+        self.end_headers()
+
+    def log_message(self, *args):
+        pass  # keep logs clean
+
+
+def start_health_server():
+    port = int(os.environ.get("PORT", "10000"))  # Render sets PORT automatically
+    server = HTTPServer(("0.0.0.0", port), HealthHandler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    logger.info("Health server listening on port %s", port)
 
 
 # ── API helpers ──────────────────────────────────────────────────────────
@@ -1402,6 +1438,7 @@ def main():
     else:
         print("⚠️  JobQueue not available — install with 'pip install \"python-telegram-bot[job-queue]\"' for auto-detection.")
 
+    start_health_server()  # tiny "ok" endpoint so Render + cron-job.org work
     print("Bot running...")
     app.run_polling()
 
