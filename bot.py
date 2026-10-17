@@ -32,22 +32,18 @@ import requests
 import threading
 from flask import Flask
 
-app = Flask(__name__)
-
-# Cron-job বা Keep-alive হিটের জন্য ফাস্ট রেসপন্স রুট
-@app.route('/')
-def home():
-    return "Bot is Active!", 200
-
-def run_flask():
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host='0.0.0.0', port=port)
-
 if __name__ == "__main__":
-    # ব্যাকগ্রাউন্ডে Flask সার্ভার চালু রাখা
+    # ১. টেলিগ্রাম অ্যাপ্লিকেশন অবজেক্ট তৈরি (এটি মিসিং ছিল)
+    application = Application.builder().token(BOT_TOKEN).build()
+
+    # ২. হ্যান্ডলারগুলো যুক্ত করা
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CallbackQueryHandler(button_handler))
+
+    # ৩. ব্যাকগ্রাউন্ডে Flask সার্ভার চালু করা
     threading.Thread(target=run_flask, daemon=True).start()
-    
-    # টেলিগ্রাম বট পোলিং শুরু করা
+
+    # ৪. বট পোলিং শুরু করা
     print("Telegram Bot is starting...")
     application.run_polling(drop_pending_updates=True)
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
