@@ -29,6 +29,26 @@ import asyncio
 import logging
 import traceback
 import requests
+from flask import Flask
+
+app = Flask(__name__)
+
+# Cron-job বা Keep-alive হিটের জন্য ফাস্ট রেসপন্স রুট
+@app.route('/')
+def home():
+    return "Bot is Active!", 200
+
+def run_flask():
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host='0.0.0.0', port=port)
+
+if __name__ == "__main__":
+    # ব্যাকগ্রাউন্ডে Flask সার্ভার চালু রাখা
+    threading.Thread(target=run_flask, daemon=True).start()
+    
+    # টেলিগ্রাম বট পোলিং শুরু করা
+    print("Telegram Bot is starting...")
+    application.run_polling(drop_pending_updates=True)
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
 from telegram.constants import ParseMode
 from telegram.ext import (
