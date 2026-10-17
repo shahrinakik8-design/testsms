@@ -981,7 +981,7 @@ async def central_updates_poller(context: ContextTypes.DEFAULT_TYPE):
                     logger.error("Failed to send code-received notification to %s: %s", chat_id, e)
 
                 group_text = (
-                    "🎉 *Code Delivered!* 🎉\n"
+                    "🎉 *Code Delivered!* 🎉\n\n"
                     f"📡 Sender: *{md_escape(r['sender'])}*\n"
                     f"📞 Number: `{mask_number_middle(r['number'])}`\n"
                 )
